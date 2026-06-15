@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Lint, format & typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint -- --max-warnings=0
+      - run: npm run format:check
+      - run: npm run typecheck
+
+  test:
+    name: Tests (PostgreSQL ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ['15', '16']
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_USER: betting
+          POSTGRES_PASSWORD: betting
+          POSTGRES_DB: betting_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U betting -d betting_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgres://betting:betting@localhost:5432/betting_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Unit tests
+        run: npm run test:unit
+      - name: Integration tests
+        run: npm run test:integration
+
+  build:
+    name: Build & scan image
+    runs-on: ubuntu-latest
+    needs: [quality, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: sportsbook-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test container
+        run: |
+          docker network create ci
+          docker run -d --name db --network ci -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=app postgres:16-alpine
+          for i in $(seq 1 30); do docker exec db pg_isready -U postgres && break; sleep 2; done
+          COMMON="--network ci -e DATABASE_URL=postgres://postgres:pw@db:5432/app -e JWT_ACCESS_SECRET=ci_secret_ci_secret_ci_secret_ci_secret -e PAYSTACK_SECRET_KEY=sk_test_ci"
+          docker run --rm $COMMON sportsbook-api:ci node dist/db/migrate.js
+          docker run --rm $COMMON sportsbook-api:ci node dist/db/seed.js
+          docker run -d --name api -p 4000:4000 $COMMON sportsbook-api:ci
+          for i in $(seq 1 30); do curl -fsS localhost:4000/ready && break; sleep 2; done
+          curl -fsS localhost:4000/api/v1/sports/leagues?featured=true | tee /dev/stderr | grep -q premier-league
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs api || true
+      - name: Vulnerability scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: sportsbook-api:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'

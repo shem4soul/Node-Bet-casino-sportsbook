@@ -1,28 +1,33 @@
-import { Pool, PoolConnection } from 'mysql2/promise';
-import { WalletRow, TransactionRow, TransactionType, InsertResult } from '../types/db';
-import { AppError } from '../middleware/errorHandler';
+import { PoolClient } from 'pg';
+import { Queryable, query, queryOne } from '../config/db';
+import { AppError } from '../lib/errors';
+import { fromMinor, toMinor } from '../lib/money';
+import type { TransactionRow, TransactionType, WalletRow } from '../types/db';
+import type { Pagination } from '../lib/http';
 
-/**
- * All balance mutations go through `adjustBalance`, which must be called
- * with a connection that is inside an active transaction (see
- * config/db.ts#withTransaction). It locks the wallet row with
- * SELECT ... FOR UPDATE so concurrent bets/games on the same user
- * serialize instead of racing on the balance.
- */
-
-async function getWalletForUpdate(conn: PoolConnection, userId: number): Promise<WalletRow | null> {
-  const [rows] = await conn.query<WalletRow[]>('SELECT * FROM wallets WHERE user_id = ? FOR UPDATE', [userId]);
-  return rows[0] || null;
+export async function createWallet(db: Queryable, userId: number, currency: string, startingBalance = 0): Promise<void> {
+  await db.query('INSERT INTO wallets (user_id, balance, currency) VALUES ($1, $2, $3)', [
+    userId,
+    fromMinor(toMinor(startingBalance)),
+    currency,
+  ]);
+  if (startingBalance > 0) {
+    await db.query(
+      `INSERT INTO transactions (user_id, type, amount, balance_after, note)
+       VALUES ($1, 'adjustment', $2, $2, 'Demo starting balance')`,
+      [userId, fromMinor(toMinor(startingBalance))]
+    );
+  }
 }
 
-export async function getWallet(pool: Pool | PoolConnection, userId: number): Promise<WalletRow | null> {
-  const [rows] = await pool.query<WalletRow[]>('SELECT * FROM wallets WHERE user_id = ?', [userId]);
-  return rows[0] || null;
+export function getWallet(db: Queryable, userId: number): Promise<WalletRow | null> {
+  return queryOne<WalletRow>(db, 'SELECT * FROM wallets WHERE user_id = $1', [userId]);
 }
 
 export interface AdjustBalanceParams {
   userId: number;
-  amount: number;
+  /** Major units, positive = credit, negative = debit. */
+  amount: string | number;
   type: TransactionType;
   referenceType?: string | null;
   referenceId?: number | null;
@@ -30,45 +35,43 @@ export interface AdjustBalanceParams {
 }
 
 /**
- * amount: positive to credit, negative to debit.
- * Throws if the debit would push balance below zero.
+ * THE only way a balance changes. Must be called with a client inside an
+ * open transaction (config/db.ts#withTransaction). Locks the wallet row
+ * (SELECT ... FOR UPDATE) so concurrent operations on one user serialize,
+ * refuses to go negative, and writes the matching ledger row.
+ *
+ * Returns the new balance as a 2dp string.
  */
-export async function adjustBalance(
-  conn: PoolConnection,
-  { userId, amount, type, referenceType = null, referenceId = null, note = null }: AdjustBalanceParams
-): Promise<number> {
-  const wallet = await getWalletForUpdate(conn, userId);
-  if (!wallet) {
-    throw new AppError('Wallet not found', 404);
-  }
+export async function adjustBalance(client: PoolClient, p: AdjustBalanceParams): Promise<string> {
+  const wallet = await queryOne<WalletRow>(client, 'SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE', [p.userId]);
+  if (!wallet) throw new AppError('Wallet not found', 404);
 
-  const newBalance = Number(wallet.balance) + Number(amount);
-  if (newBalance < 0) {
-    throw new AppError('Insufficient balance', 400);
-  }
+  const deltaMinor = toMinor(p.amount);
+  if (deltaMinor === 0) throw new AppError('Ledger amount cannot be zero', 500);
+  const newMinor = toMinor(wallet.balance) + deltaMinor;
+  if (newMinor < 0) throw new AppError('Insufficient balance', 400, 'INSUFFICIENT_FUNDS');
 
-  await conn.query('UPDATE wallets SET balance = ? WHERE user_id = ?', [newBalance.toFixed(2), userId]);
-
-  await conn.query(
+  const newBalance = fromMinor(newMinor);
+  await client.query('UPDATE wallets SET balance = $1 WHERE user_id = $2', [newBalance, p.userId]);
+  await client.query(
     `INSERT INTO transactions (user_id, type, amount, balance_after, reference_type, reference_id, note)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [userId, type, Number(amount).toFixed(2), newBalance.toFixed(2), referenceType, referenceId, note]
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [p.userId, p.type, fromMinor(deltaMinor), newBalance, p.referenceType ?? null, p.referenceId ?? null, p.note ?? null]
   );
-
   return newBalance;
 }
 
-export async function listTransactions(
-  pool: Pool,
+export function listTransactions(
+  db: Queryable,
   userId: number,
-  { limit = 50, offset = 0 }: { limit?: number; offset?: number } = {}
+  { limit, offset, type }: Pagination & { type?: TransactionType }
 ): Promise<TransactionRow[]> {
-  const [rows] = await pool.query<TransactionRow[]>(
-    'SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?',
-    [userId, Number(limit), Number(offset)]
+  return query<TransactionRow>(
+    db,
+    `SELECT * FROM transactions
+     WHERE user_id = $1 AND ($2::text IS NULL OR type = $2)
+     ORDER BY created_at DESC, id DESC
+     LIMIT $3 OFFSET $4`,
+    [userId, type ?? null, limit, offset]
   );
-  return rows;
 }
-
-// Re-exported for services that need the InsertResult type alongside these functions
-export type { InsertResult };

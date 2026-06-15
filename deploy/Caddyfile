@@ -1,0 +1,12 @@
+# Automatic HTTPS (Let's Encrypt) for $DOMAIN, load-balanced across API replicas.
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy api:4000 {
+		lb_policy round_robin
+		health_uri /health
+		header_up X-Request-Id {http.request.uuid}
+	}
+	# Metrics stay internal.
+	@metrics path /metrics
+	respond @metrics 404
+}
