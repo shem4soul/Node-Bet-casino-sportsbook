@@ -1,5 +1,5 @@
 import { PoolClient } from 'pg';
-import { logger } from '../config/logger';
+import { createLogger } from '../config/logger';
 import { query, queryOne, withTransaction } from '../config/db';
 import { badRequest, conflict, notFound } from '../lib/errors';
 import { combineOdds, fromMinor, payoutMinor, toMinor } from '../lib/money';
@@ -7,6 +7,8 @@ import * as walletRepo from '../repositories/walletRepository';
 import { LegResult, Score, settleMarketFromScore } from './markets/footballMarkets';
 import { audit } from './auditService';
 import type { BetSelectionRow, BetSlipRow, EventRow, MarketRow, OddsRow } from '../types/db';
+
+const log = createLogger('settlement');
 
 /**
  * Settles one market given a result per selection, then resolves every bet
@@ -32,6 +34,20 @@ async function settleMarketWithResults(c: PoolClient, market: MarketRow, results
   }
   let paid = 0;
   for (const id of slipIds) if (await maybeSettleSlip(c, id)) paid += 1;
+  log.info(
+    {
+      event: 'market.settled',
+      marketId: market.id,
+      eventId: market.event_id,
+      marketType: market.market_type,
+      line: market.line,
+      results,
+      legsSettled: legs.length,
+      slipsResolved: slipIds.size,
+      slipsPaid: paid,
+    },
+    `Market ${market.market_type}${market.line !== null ? ` ${market.line}` : ''} settled`
+  );
   return { marketId: market.id, legsSettled: legs.length, slipsResolved: slipIds.size, slipsPaid: paid };
 }
 
@@ -48,6 +64,7 @@ export async function maybeSettleSlip(c: PoolClient, slipId: number): Promise<bo
   const legs = await query<BetSelectionRow>(c, 'SELECT * FROM bet_selections WHERE bet_slip_id = $1', [slipId]);
   if (legs.some((l) => l.result === 'lost')) {
     await c.query(`UPDATE bet_slips SET status = 'lost', payout = 0, settled_at = now() WHERE id = $1`, [slipId]);
+    log.debug({ event: 'bet.settled', betId: slipId, ownerId: slip.user_id, outcome: 'lost', stake: slip.stake }, 'Bet lost');
     return false;
   }
   if (legs.some((l) => l.result === 'pending')) return false;
@@ -62,6 +79,10 @@ export async function maybeSettleSlip(c: PoolClient, slipId: number): Promise<bo
       note: 'All selections void',
     });
     await c.query(`UPDATE bet_slips SET status = 'void', payout = $2, settled_at = now() WHERE id = $1`, [slipId, slip.stake]);
+    log.info(
+      { event: 'bet.settled', betId: slipId, ownerId: slip.user_id, outcome: 'void', refund: slip.stake },
+      'Bet void — stake refunded'
+    );
     return true;
   }
 
@@ -75,6 +96,10 @@ export async function maybeSettleSlip(c: PoolClient, slipId: number): Promise<bo
     referenceId: slipId,
   });
   await c.query(`UPDATE bet_slips SET status = 'won', payout = $2, settled_at = now() WHERE id = $1`, [slipId, payout]);
+  log.info(
+    { event: 'bet.settled', betId: slipId, ownerId: slip.user_id, outcome: 'won', stake: slip.stake, payout },
+    `Bet won — paid ${payout}`
+  );
   return true;
 }
 
@@ -110,6 +135,7 @@ export async function settleMarketManually(
 
     const summary = await settleMarketWithResults(c, market, results);
     await audit(c, { actorId, action: 'market.settle', entityType: 'market', entityId: marketId, metadata: { results }, ip });
+    log.info({ event: 'market.settled_manually', marketId, results }, 'Market settled manually by admin');
     return summary;
   });
 }
@@ -172,7 +198,20 @@ export async function recordResultAndSettle(
       metadata: { score, source, manual: manual.length },
       ip,
     });
-    logger.info({ eventId, settled: settled.length, manual: manual.length, source }, 'Event result recorded');
+    log.info(
+      {
+        event: 'event.result_recorded',
+        eventId,
+        match: `${ev.home_team} vs ${ev.away_team}`,
+        score,
+        source,
+        marketsSettled: settled.length,
+        needsManual: manual,
+      },
+      `Result ${ev.home_team} ${score.home}-${score.away} ${ev.away_team} recorded (${source})`
+    );
+    if (manual.length)
+      log.warn({ event: 'event.manual_settlement_needed', eventId, markets: manual }, `${manual.length} market(s) need manual settlement`);
     return { eventId, score, settledMarkets: settled, needsManualSettlement: manual };
   });
 }
@@ -198,6 +237,17 @@ export async function cancelEvent(actorId: number, eventId: number, reason: stri
       legs += r.legsSettled;
     }
     await audit(c, { actorId, action: 'event.cancel', entityType: 'event', entityId: eventId, metadata: { reason }, ip });
+    log.warn(
+      {
+        event: 'event.cancelled',
+        eventId,
+        match: `${ev.home_team} vs ${ev.away_team}`,
+        reason,
+        voidedMarkets: markets.length,
+        voidedLegs: legs,
+      },
+      'Event cancelled — all markets void'
+    );
     return { eventId, voidedMarkets: markets.length, voidedLegs: legs };
   });
 }

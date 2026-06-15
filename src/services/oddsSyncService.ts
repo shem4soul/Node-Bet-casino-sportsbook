@@ -1,11 +1,13 @@
 import { env } from '../config/env';
-import { logger } from '../config/logger';
+import { createLogger } from '../config/logger';
 import { pool, query, queryOne, withTransaction } from '../config/db';
 import { badRequest } from '../lib/errors';
 import { oddsApi } from '../integrations/oddsApi/oddsApiClient';
 import { aggregate, collectQuotes, FeedEvent, normalizeEvent } from '../integrations/oddsApi/normalize';
 import { recordResultAndSettle } from './settlementService';
 import type { EventRow, LeagueRow } from '../types/db';
+
+const logger = createLogger('odds-sync');
 
 const PROVIDER = 'odds-api-io';
 
@@ -148,10 +150,16 @@ export async function syncLeagues(slugs?: string[]): Promise<LeagueSyncSummary[]
       );
   const out: LeagueSyncSummary[] = [];
   for (const l of leagues) {
+    const started = Date.now();
     try {
-      out.push(await syncLeague(l));
+      const s = await syncLeague(l);
+      out.push(s);
+      logger[s.errors.length ? 'warn' : 'info'](
+        { event: 'odds_sync.league', ...s, errors: s.errors.slice(0, 5), errorCount: s.errors.length, durationMs: Date.now() - started },
+        `Synced ${l.slug}: ${s.eventsSeen} events, ${s.eventsCreated} new, ${s.pricesUpdated} price changes`
+      );
     } catch (err) {
-      logger.warn({ err, league: l.slug }, 'League sync failed');
+      logger.warn({ event: 'odds_sync.failed', err, league: l.slug }, 'League sync failed');
       out.push({
         league: l.slug,
         eventsSeen: 0,

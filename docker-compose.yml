@@ -13,6 +13,13 @@ x-app: &app
   environment:
     DATABASE_URL: postgres://${POSTGRES_USER:-sportsbook}:${POSTGRES_PASSWORD:-sportsbook}@db:5432/${POSTGRES_DB:-sportsbook}
   restart: unless-stopped
+  # JSON logs go to stdout; Docker rotates them so they can't fill the disk.
+  # Ship them to Loki / ELK / Datadog / CloudWatch by pointing your agent at the container logs.
+  logging:
+    driver: json-file
+    options:
+      max-size: '20m'
+      max-file: '10'
 
 services:
   db:

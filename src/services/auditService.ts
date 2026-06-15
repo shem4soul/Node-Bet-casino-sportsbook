@@ -1,5 +1,8 @@
 import { Queryable, pool, query } from '../config/db';
 import type { Pagination } from '../lib/http';
+import { createLogger } from '../config/logger';
+
+const log = createLogger('audit');
 
 export interface AuditEntry {
   actorId: number | null;
@@ -11,6 +14,18 @@ export interface AuditEntry {
 }
 
 export async function audit(db: Queryable, e: AuditEntry): Promise<void> {
+  // Mirrors every audit-table row into the log stream (event = "audit.<action>").
+  log.info(
+    {
+      event: `audit.${e.action}`,
+      actorId: e.actorId,
+      entityType: e.entityType,
+      entityId: e.entityId,
+      metadata: e.metadata,
+      ip: e.ip ?? undefined,
+    },
+    `Audit: ${e.action}${e.entityType ? ` ${e.entityType}#${e.entityId}` : ''}`
+  );
   await db.query(
     `INSERT INTO audit_logs (actor_id, action, entity_type, entity_id, metadata, ip)
      VALUES ($1, $2, $3, $4, $5, $6)`,

@@ -2,6 +2,8 @@
 
 Production-ready sportsbook + casino backend in **Node.js + TypeScript + PostgreSQL**, with **Paystack** deposits and payouts and football betting on the **English Premier League, LaLiga and the Nigeria Premier Football League (NPFL)**, plus Serie A, Bundesliga, Ligue 1, the Champions League and the EFL Championship.
 
+**Author:** Emmanuel Seun Shittu, Software Engineer · [GitHub](https://github.com/shem4soul) · [LinkedIn](https://linkedin.com/in/emmanuelseunshittu) · [shem4soul@gmail.com](mailto:shem4soul@gmail.com)
+
 > ⚠️ **Regulatory notice.** Real-money betting is licensed activity. In Nigeria, you need a licence from the National Lottery Regulatory Commission and/or the relevant state gaming board (e.g. the Lagos State Lotteries and Gaming Authority) before taking bets, plus KYC/AML processes and responsible-gambling controls that satisfy them. Paystack also requires approval for gaming businesses. This repository gives you the technical platform, not a compliance programme. Get legal advice before launching.
 
 ---
@@ -16,11 +18,15 @@ Production-ready sportsbook + casino backend in **Node.js + TypeScript + Postgre
 - [Leagues, markets & odds](#leagues-markets--odds)
 - [Settlement](#settlement)
 - [API overview](#api-overview)
+- [API documentation (Swagger)](#api-documentation-swagger)
+- [Logging](#logging)
 - [Architecture](#architecture)
 - [Testing](#testing)
 - [CI/CD](#cicd)
 - [Production checklist](#production-checklist)
 - [Upgrading from v1 (MySQL)](#upgrading-from-v1-mysql)
+- [Author](#author)
+- [Acknowledgements](#acknowledgements)
 
 ---
 
@@ -60,10 +66,11 @@ Production-ready sportsbook + casino backend in **Node.js + TypeScript + Postgre
 - PostgreSQL with an append-only ledger. A unique index prevents double payouts.
 - Versioned SQL migrations with checksums and an advisory lock.
 - Background worker with cluster-safe cron jobs (Postgres advisory locks).
-- zod-validated config and requests, structured JSON logs (pino) with request IDs, Prometheus `/metrics`, `/health` and `/ready`, graceful shutdown.
-- OpenAPI 3 spec + Swagger UI at `/docs`.
+- **Structured logging:** JSON logs (pino) with request IDs and user IDs on every line, named business events (`bet.placed`, `deposit.credited`, `withdrawal.refunded`, ...), PII masking, secret redaction, and an optional log file.
+- **Swagger / OpenAPI 3 docs** at `/docs`: all 81 operations with full request/response schemas, examples and error codes. Contract tests keep the docs in sync with the code.
+- zod-validated config and requests, Prometheus `/metrics`, `/health` and `/ready`, graceful shutdown.
 - Multi-stage Docker image (non-root, tini, healthcheck), docker-compose stack, GitHub Actions CI/CD to GHCR with SSH deploys.
-- 100+ unit and integration tests against real PostgreSQL.
+- 109 unit, integration and contract tests against real PostgreSQL.
 
 ---
 
@@ -246,6 +253,79 @@ curl -X POST $API/api/v1/sports/bets \
 
 Errors share one shape: `{ "error": { "code": "ODDS_CHANGED", "message": "...", "details": {...}, "requestId": "..." } }`.
 
+## API documentation (Swagger)
+
+Interactive docs are served by the API itself:
+
+| URL | What |
+| --- | --- |
+| `/docs` | Swagger UI: browse, **Authorize** with your access token, and **Try it out** against the running server |
+| `/docs/openapi.json` | OpenAPI 3.0 spec (JSON), for Postman/Insomnia import or client generation |
+| `/docs/openapi.yaml` | Same spec, YAML |
+
+The source of truth is [`src/docs/openapi.yaml`](src/docs/openapi.yaml): 81 operations, each with an `operationId`, request and response schemas, examples, and its possible error codes. All errors share the documented `Error` schema; branch on `error.code`.
+
+Using it from Swagger UI:
+1. `POST /auth/login` (or `/auth/register`) → **Try it out** → copy `accessToken` from the response.
+2. Click **Authorize** (top right), paste the token. Swagger UI remembers it across reloads.
+3. Try `GET /sports/featured`, then `POST /sports/bets`.
+
+Generate a typed client for your frontend or mobile app:
+
+```bash
+npx @openapitools/openapi-generator-cli generate -i http://localhost:4000/docs/openapi.json -g typescript-fetch -o ./sdk
+# or: -g kotlin / -g swift5 / -g dart for mobile apps
+```
+
+**Keeping docs honest.** When you add or change an endpoint, update `openapi.yaml` in the same PR. CI runs `npm run docs:validate`, the route-coverage unit test and the contract test, so drift fails the build.
+
+**Production:** set `DOCS_USERNAME` and `DOCS_PASSWORD` to put the docs behind HTTP Basic auth, or `DOCS_ENABLED=false` to turn them off.
+
+## Logging
+
+Logs are structured JSON ([pino](https://getpino.io)), one object per line, written to stdout (and optionally `LOG_FILE`). Locally they're pretty-printed. Every line carries:
+
+| Field | Meaning |
+| --- | --- |
+| `time`, `level` | ISO timestamp, `debug`/`info`/`warn`/`error`/`fatal` |
+| `service`, `env`, `version` | Which deployment wrote it |
+| `module` | `http`, `auth`, `bets`, `payments`, `withdrawals`, `settlement`, `ledger`, `audit`, `jobs`, `odds-sync`, ... |
+| `requestId` | From the client's `X-Request-Id` header or generated. Echoed in the response header and in error bodies, so a support ticket can be traced end to end |
+| `userId` | The authenticated user, attached automatically to every line written during their request (even deep in services) |
+| `job` | Background job name, for lines written by the worker |
+| `event` | Stable name for business events (below) |
+
+Each HTTP request produces one access line: `POST /api/v1/sports/bets 201 13ms`, with `durationMs`, `userId` and, on failure, the API `errorCode`.
+
+Key business events (`event` field):
+
+| Area | Events |
+| --- | --- |
+| Auth | `auth.register`, `auth.login`, `auth.login.failed` ⚠️, `auth.account.locked` ⚠️, `auth.refresh.reuse_detected` ⚠️ (possible token theft), `auth.password.changed`, `auth.password_reset.*` |
+| Deposits | `deposit.initialized`, `deposit.credited` (with `source`: webhook / verify / reconcile), `deposit.failed`, `deposit.amount_mismatch` 🚨, `webhook.received`, `webhook.duplicate`, `webhook.invalid_signature` ⚠️ |
+| Withdrawals | `withdrawal.requested`, `withdrawal.transfer_sent`, `withdrawal.succeeded`, `withdrawal.refunded` ⚠️, `withdrawal.outcome_unknown` ⚠️, `withdrawal.otp_required` 🚨 |
+| Betting | `bet.placed`, `bet.rejected` (`reason`: odds_changed, selections_unavailable, max_payout), `bet.cashed_out`, `bet.settled`, `booking_code.created` |
+| Settlement | `market.settled`, `event.result_recorded`, `event.manual_settlement_needed` ⚠️, `event.cancelled` |
+| Back office | `audit.*`: every admin and responsible-gambling action (mirrors the `audit_logs` table) |
+| System | `server.started`, `scheduler.started`, `job.finished`, `job.failed` 🚨, `odds_sync.league`, `ledger.entry` (debug) |
+
+⚠️ = worth a dashboard; 🚨 = alert on it.
+
+**Privacy & secrets.** Passwords, tokens, `Authorization` headers, Paystack signatures and transfer recipient codes are redacted. Emails and account numbers are masked (`ch***@example.com`, `******6789`). Query strings are never logged.
+
+**Configuration:** `LOG_LEVEL` (`debug` adds ledger and per-bet settlement detail), `LOG_PRETTY`, `LOG_FILE`, `LOG_PROBES`. Under Docker, logs go to stdout with rotation (20 MB × 10 files per container, set in `docker-compose.yml`). Point Loki/Promtail, Vector, Fluent Bit, the Datadog agent or CloudWatch at the container logs.
+
+Example queries:
+
+```bash
+# everything that happened in one request
+docker compose logs api | grep '"requestId":"3f2c9a1e-...'
+# all money movements for user 42 (needs LOG_LEVEL=debug for ledger lines)
+docker compose logs api worker | grep '"userId":42' | grep -E 'deposit|withdrawal|bet|ledger'
+# security signals
+docker compose logs api | grep -E 'reuse_detected|account.locked|invalid_signature'
+```
+
 ## Architecture
 
 ```
@@ -284,6 +364,8 @@ npm test                 # unit + integration
 npm run test:unit        # no database needed
 ```
 
+A **contract test** (`tests/integration/openapi.contract.test.ts`) calls every documented operation and validates each real response against `openapi.yaml`. It fails if a response has the wrong types, misses required fields, returns fields the docs don't mention, or if an endpoint is never exercised. A unit test checks that every Express route is documented and every documented route exists.
+
 Integration tests run the real Express app against real PostgreSQL. In-process fake Paystack and odds-api.io servers mean the real HTTP clients get exercised. Coverage includes registration and auth flows, token reuse detection, webhook idempotency under concurrent delivery, forged webhooks, amount mismatches, deposit limits, self-exclusion, concurrent bets against one wallet, odds movement, idempotent bet placement, settlement across every market type, cancellations, cash-out, booking codes, transfers (success, failure, reversal, timeout), admin review, reports, provably-fair verification, and feed sync.
 
 ## CI/CD
@@ -314,7 +396,9 @@ On the host: install Docker (Compose ≥ 2.24), create `DEPLOY_PATH/.env` from `
 
 - [ ] Licence(s) in place; Paystack approved for gaming; terms & privacy published.
 - [ ] Live Paystack keys; webhook URL configured; OTP for transfers disabled; Paystack balance funded.
-- [ ] `NODE_ENV=production`, strong `JWT_ACCESS_SECRET`, `DEMO_STARTING_BALANCE=0`, `DOCS_ENABLED` as desired, `METRICS_TOKEN` set.
+- [ ] `NODE_ENV=production`, strong `JWT_ACCESS_SECRET`, `DEMO_STARTING_BALANCE=0`, `METRICS_TOKEN` set.
+- [ ] `/docs` protected with `DOCS_USERNAME`/`DOCS_PASSWORD` (or `DOCS_ENABLED=false`).
+- [ ] Container logs shipped to your log platform, with alerts on `level=error` and on the events listed under [Logging](#logging).
 - [ ] `TRUST_PROXY` matches your proxy chain; `CORS_ORIGINS` restricted.
 - [ ] Managed PostgreSQL with PITR backups, `DATABASE_SSL=true`.
 - [ ] `SMTP_URL` configured (password reset emails).
@@ -328,6 +412,20 @@ On the host: install Docker (Compose ≥ 2.24), create `DEPLOY_PATH/.env` from `
 
 v2 is a rewrite of the data layer: MySQL → PostgreSQL, a new schema (`migrations/001_initial_schema.sql`), versioned routes (`/api/*` → `/api/v1/*`), a real Paystack integration (the mock gateway is gone), and refresh tokens. Endpoint names changed in places (for example `POST /wallet/deposit/initialize` → `POST /wallet/deposits`, `POST /admin/markets/:id/settle` is unchanged). There is no automatic data migration. To carry over existing users and balances, export them from MySQL and import them into the new tables, posting each opening balance as an `adjustment` ledger row so `balance == SUM(ledger)` holds.
 
+## Author
+
+**Emmanuel Seun Shittu**, Software Engineer (React · Next.js · NestJS · Node.js · React Native)
+
+- GitHub: [@shem4soul](https://github.com/shem4soul)
+- LinkedIn: [emmanuelseunshittu](https://linkedin.com/in/emmanuelseunshittu)
+- Email: [shem4soul@gmail.com](mailto:shem4soul@gmail.com)
+
+Questions, bug reports and contributions are welcome. Open an issue or a pull request on [GitHub](https://github.com/shem4soul/Node-Bet-casino-sportsbook).
+
+## Acknowledgements
+
+This project grew out of an open-source casino/sportsbook starter (Express + MySQL) and builds on open-source software, including [Express](https://expressjs.com), [node-postgres](https://node-postgres.com), [zod](https://zod.dev), [pino](https://getpino.io), [Swagger UI](https://swagger.io/tools/swagger-ui/), [Vitest](https://vitest.dev) and [PostgreSQL](https://www.postgresql.org). Payments use the [Paystack API](https://paystack.com/docs/api/) and odds data comes from [Odds-API.io](https://odds-api.io).
+
 ## License
 
-The upstream archive did not include a LICENSE file. Confirm the original project's licence terms and add a `LICENSE` file before redistributing.
+No licence file has been added yet. Until one is, all rights are reserved by the author. Add a `LICENSE` file (for example MIT) if you want others to reuse the code.

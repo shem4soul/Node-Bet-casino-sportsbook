@@ -8,6 +8,9 @@ import { randomToken, sha256, signAccessToken } from '../lib/tokens';
 import * as walletRepo from '../repositories/walletRepository';
 import { sendMail } from './notificationService';
 import type { UserRow } from '../types/db';
+import { createLogger, maskEmail } from '../config/logger';
+
+const log = createLogger('auth');
 
 export interface ClientContext {
   ip?: string | null;
@@ -81,13 +84,14 @@ export async function register(input: RegisterInput, ctx: ClientContext) {
   const dob = new Date(`${input.dateOfBirth}T00:00:00Z`);
   if (Number.isNaN(dob.getTime())) throw badRequest('Invalid dateOfBirth');
   if (ageInYears(dob) < env.MIN_AGE_YEARS) {
+    log.info({ event: 'auth.register.rejected', reason: 'underage', ip: ctx.ip }, 'Registration rejected: under age');
     throw new AppError(`You must be at least ${env.MIN_AGE_YEARS} years old to register`, 403, 'UNDERAGE');
   }
 
   const passwordHash = await hashPassword(input.password);
 
   try {
-    return await withTransaction(async (c) => {
+    const result = await withTransaction(async (c) => {
       const user = await queryOne<UserRow>(
         c,
         `INSERT INTO users (username, email, phone, password_hash, date_of_birth, first_name, last_name)
@@ -99,8 +103,22 @@ export async function register(input: RegisterInput, ctx: ClientContext) {
       const { tokens } = await issueTokens(c, user!, ctx);
       return { user: publicUser(user!), ...tokens };
     });
+    log.info(
+      {
+        event: 'auth.register',
+        newUserId: result.user.id,
+        username: result.user.username,
+        email: maskEmail(result.user.email),
+        ip: ctx.ip,
+      },
+      'User registered'
+    );
+    return result;
   } catch (err: any) {
-    if (err?.code === PG_UNIQUE_VIOLATION) throw conflict('Username, email or phone already in use', 'ACCOUNT_EXISTS');
+    if (err?.code === PG_UNIQUE_VIOLATION) {
+      log.info({ event: 'auth.register.rejected', reason: 'duplicate', ip: ctx.ip }, 'Registration rejected: account exists');
+      throw conflict('Username, email or phone already in use', 'ACCOUNT_EXISTS');
+    }
     throw err;
   }
 }
@@ -114,10 +132,15 @@ export async function login(identifier: string, password: string, ctx: ClientCon
 
   if (!user) {
     await burnPasswordCheck(password);
+    log.warn({ event: 'auth.login.failed', reason: 'unknown_account', ip: ctx.ip }, 'Login failed: unknown account');
     throw unauthorized('Invalid credentials', 'INVALID_CREDENTIALS');
   }
 
   if (user.locked_until && user.locked_until > new Date()) {
+    log.warn(
+      { event: 'auth.login.blocked', targetUserId: user.id, lockedUntil: user.locked_until, ip: ctx.ip },
+      'Login attempt on locked account'
+    );
     throw new AppError('Too many failed login attempts. Try again later.', 429, 'ACCOUNT_LOCKED');
   }
 
@@ -131,6 +154,12 @@ export async function login(identifier: string, password: string, ctx: ClientCon
        WHERE id = $1`,
       [user.id, env.MAX_FAILED_LOGINS, env.LOCKOUT_MINUTES]
     );
+    const attempts = user.failed_login_attempts + 1;
+    const locked = attempts >= env.MAX_FAILED_LOGINS;
+    log.warn(
+      { event: locked ? 'auth.account.locked' : 'auth.login.failed', reason: 'bad_password', targetUserId: user.id, attempts, ip: ctx.ip },
+      locked ? `Account locked for ${env.LOCKOUT_MINUTES} min after ${attempts} failed logins` : 'Login failed: wrong password'
+    );
     throw unauthorized('Invalid credentials', 'INVALID_CREDENTIALS');
   }
 
@@ -138,6 +167,7 @@ export async function login(identifier: string, password: string, ctx: ClientCon
 
   await pool.query('UPDATE users SET failed_login_attempts = 0, locked_until = NULL, last_login_at = now() WHERE id = $1', [user.id]);
   const { tokens } = await issueTokens(pool, user, ctx);
+  log.info({ event: 'auth.login', targetUserId: user.id, role: user.role, ip: ctx.ip, userAgent: ctx.userAgent }, 'User logged in');
   return { user: publicUser(user), ...tokens };
 }
 
@@ -158,7 +188,7 @@ export async function refresh(refreshToken: string, ctx: ClientContext) {
     if (row.revoked_at) {
       // Must COMMIT the family revocation, so signal reuse instead of throwing inside the transaction.
       await c.query('UPDATE refresh_tokens SET revoked_at = COALESCE(revoked_at, now()) WHERE family_id = $1', [row.family_id]);
-      return { reused: true as const };
+      return { reused: true as const, userId: row.user_id, familyId: row.family_id };
     }
     if (row.expires_at < new Date()) throw unauthorized('Refresh token expired', 'REFRESH_EXPIRED');
 
@@ -169,7 +199,13 @@ export async function refresh(refreshToken: string, ctx: ClientContext) {
     await c.query('UPDATE refresh_tokens SET revoked_at = now(), replaced_by = $2 WHERE id = $1', [row.id, refreshTokenId]);
     return { reused: false as const, tokens };
   });
-  if (result.reused) throw unauthorized('Refresh token reuse detected; all sessions in this chain were revoked', 'REFRESH_REUSED');
+  if (result.reused) {
+    log.warn(
+      { event: 'auth.refresh.reuse_detected', targetUserId: result.userId, familyId: result.familyId, ip: ctx.ip },
+      'Refresh token reuse detected — session chain revoked (possible token theft)'
+    );
+    throw unauthorized('Refresh token reuse detected; all sessions in this chain were revoked', 'REFRESH_REUSED');
+  }
   return result.tokens;
 }
 
@@ -178,7 +214,8 @@ export async function logout(refreshToken: string): Promise<void> {
 }
 
 export async function logoutAll(userId: number): Promise<void> {
-  await pool.query('UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [userId]);
+  const r = await pool.query('UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [userId]);
+  log.info({ event: 'auth.logout_all', sessionsRevoked: r.rowCount }, 'All sessions revoked');
 }
 
 export async function getProfile(userId: number) {
@@ -206,6 +243,7 @@ export async function updateProfile(userId: number, p: { firstName?: string; las
 export async function changePassword(userId: number, currentPassword: string, newPassword: string) {
   const user = await queryOne<UserRow>(pool, 'SELECT * FROM users WHERE id = $1', [userId]);
   if (!user || !(await comparePassword(currentPassword, user.password_hash))) {
+    log.warn({ event: 'auth.password_change.failed' }, 'Password change failed: wrong current password');
     throw unauthorized('Current password is incorrect', 'INVALID_CREDENTIALS');
   }
   const hash = await hashPassword(newPassword);
@@ -213,12 +251,19 @@ export async function changePassword(userId: number, currentPassword: string, ne
     await c.query('UPDATE users SET password_hash = $2 WHERE id = $1', [userId, hash]);
     await c.query('UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [userId]);
   });
+  log.info({ event: 'auth.password.changed' }, 'Password changed; other sessions revoked');
 }
 
 /** Always resolves the same way whether or not the email exists (no enumeration). */
 export async function requestPasswordReset(email: string): Promise<void> {
   const user = await queryOne<UserRow>(pool, 'SELECT * FROM users WHERE lower(email) = lower($1)', [email]);
-  if (!user || user.status === 'banned' || user.status === 'closed') return;
+  if (!user || user.status === 'banned' || user.status === 'closed') {
+    log.info(
+      { event: 'auth.password_reset.requested', matched: false, email: maskEmail(email) },
+      'Password reset requested for unknown/disabled account'
+    );
+    return;
+  }
 
   const token = randomToken(32);
   await pool.query(
@@ -234,6 +279,7 @@ export async function requestPasswordReset(email: string): Promise<void> {
       `${env.PASSWORD_RESET_TTL_MINUTES} minutes.\n\n${env.FRONTEND_URL}/reset-password?token=${token}\n\n` +
       `If you didn't ask for this, you can ignore this email.`,
   });
+  log.info({ event: 'auth.password_reset.requested', matched: true, targetUserId: user.id }, 'Password reset email issued');
 }
 
 export async function resetPassword(token: string, newPassword: string): Promise<void> {
@@ -245,9 +291,13 @@ export async function resetPassword(token: string, newPassword: string): Promise
        WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now() FOR UPDATE`,
       [sha256(token)]
     );
-    if (!row) throw badRequest('Reset link is invalid or has expired', 'RESET_TOKEN_INVALID');
+    if (!row) {
+      log.warn({ event: 'auth.password_reset.invalid_token' }, 'Password reset with invalid/expired token');
+      throw badRequest('Reset link is invalid or has expired', 'RESET_TOKEN_INVALID');
+    }
     await c.query('UPDATE password_reset_tokens SET used_at = now() WHERE id = $1', [row.id]);
     await c.query('UPDATE users SET password_hash = $2, failed_login_attempts = 0, locked_until = NULL WHERE id = $1', [row.user_id, hash]);
     await c.query('UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [row.user_id]);
+    log.info({ event: 'auth.password_reset.completed', targetUserId: row.user_id }, 'Password reset completed');
   });
 }

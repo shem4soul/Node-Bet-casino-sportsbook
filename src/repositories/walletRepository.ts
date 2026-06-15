@@ -4,6 +4,9 @@ import { AppError } from '../lib/errors';
 import { fromMinor, toMinor } from '../lib/money';
 import type { TransactionRow, TransactionType, WalletRow } from '../types/db';
 import type { Pagination } from '../lib/http';
+import { createLogger } from '../config/logger';
+
+const log = createLogger('ledger');
 
 export async function createWallet(db: Queryable, userId: number, currency: string, startingBalance = 0): Promise<void> {
   await db.query('INSERT INTO wallets (user_id, balance, currency) VALUES ($1, $2, $3)', [
@@ -49,7 +52,13 @@ export async function adjustBalance(client: PoolClient, p: AdjustBalanceParams):
   const deltaMinor = toMinor(p.amount);
   if (deltaMinor === 0) throw new AppError('Ledger amount cannot be zero', 500);
   const newMinor = toMinor(wallet.balance) + deltaMinor;
-  if (newMinor < 0) throw new AppError('Insufficient balance', 400, 'INSUFFICIENT_FUNDS');
+  if (newMinor < 0) {
+    log.debug(
+      { event: 'ledger.insufficient_funds', walletUserId: p.userId, type: p.type, amount: fromMinor(deltaMinor), balance: wallet.balance },
+      'Insufficient balance'
+    );
+    throw new AppError('Insufficient balance', 400, 'INSUFFICIENT_FUNDS');
+  }
 
   const newBalance = fromMinor(newMinor);
   await client.query('UPDATE wallets SET balance = $1 WHERE user_id = $2', [newBalance, p.userId]);
@@ -57,6 +66,18 @@ export async function adjustBalance(client: PoolClient, p: AdjustBalanceParams):
     `INSERT INTO transactions (user_id, type, amount, balance_after, reference_type, reference_id, note)
      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
     [p.userId, p.type, fromMinor(deltaMinor), newBalance, p.referenceType ?? null, p.referenceId ?? null, p.note ?? null]
+  );
+  log.debug(
+    {
+      event: 'ledger.entry',
+      walletUserId: p.userId,
+      type: p.type,
+      amount: fromMinor(deltaMinor),
+      balanceAfter: newBalance,
+      referenceType: p.referenceType,
+      referenceId: p.referenceId,
+    },
+    `${p.type} ${fromMinor(deltaMinor)}`
   );
   return newBalance;
 }

@@ -25,7 +25,8 @@
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
     "test:integration": "vitest run tests/integration",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "docs:validate": "node scripts/validate-openapi.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -47,6 +48,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@apidevtools/swagger-parser": "^10.1.1",
     "@eslint/js": "^9.39.5",
     "@types/bcryptjs": "^2.4.6",
     "@types/compression": "^1.8.1",
@@ -59,6 +61,8 @@
     "@types/pg": "^8.23.1",
     "@types/supertest": "^6.0.3",
     "@types/swagger-ui-express": "^4.1.8",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "eslint": "^9.39.5",
     "globals": "^15.15.0",
     "pino-pretty": "^11.3.0",
@@ -68,5 +72,18 @@
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.72.0",
     "vitest": "^2.1.9"
+  },
+  "author": {
+    "name": "Emmanuel Seun Shittu",
+    "email": "shem4soul@gmail.com",
+    "url": "https://github.com/shem4soul"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shem4soul/Node-Bet-casino-sportsbook.git"
+  },
+  "homepage": "https://github.com/shem4soul/Node-Bet-casino-sportsbook#readme",
+  "bugs": {
+    "url": "https://github.com/shem4soul/Node-Bet-casino-sportsbook/issues"
   }
 }

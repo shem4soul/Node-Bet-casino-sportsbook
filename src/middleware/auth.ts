@@ -2,6 +2,7 @@ import { NextFunction, Request, Response } from 'express';
 import { pool, queryOne } from '../config/db';
 import { forbidden, unauthorized } from '../lib/errors';
 import { verifyAccessToken } from '../lib/tokens';
+import { setContext } from '../lib/requestContext';
 import type { UserRow } from '../types/db';
 
 /**
@@ -39,6 +40,7 @@ export async function requireAuth(req: Request, _res: Response, next: NextFuncti
       kycStatus: user.kyc_status,
       selfExclusionUntil: user.self_exclusion_until,
     };
+    setContext({ userId: user.id, role: user.role });
     next();
   } catch (err) {
     next(err);

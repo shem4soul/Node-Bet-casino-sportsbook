@@ -1,6 +1,6 @@
 import { PoolClient } from 'pg';
 import { env } from '../config/env';
-import { logger } from '../config/logger';
+import { createLogger, maskAccount } from '../config/logger';
 import { pool, query, queryOne, withTransaction, PG_UNIQUE_VIOLATION } from '../config/db';
 import { AppError, badRequest, conflict, forbidden, notFound } from '../lib/errors';
 import { fromMinor, toMinor } from '../lib/money';
@@ -10,6 +10,8 @@ import * as walletRepo from '../repositories/walletRepository';
 import { audit } from './auditService';
 import type { BankAccountRow, WithdrawalRow } from '../types/db';
 import type { Pagination } from '../lib/http';
+
+const log = createLogger('withdrawals');
 
 // ---------------------------------------------------------------------------
 // Banks & bank accounts
@@ -75,7 +77,7 @@ export async function addBankAccount(userId: number, bankCode: string, accountNu
   });
 
   try {
-    return await withTransaction(async (c) => {
+    const saved = await withTransaction(async (c) => {
       const hasDefault = await queryOne(c, 'SELECT 1 FROM bank_accounts WHERE user_id = $1 AND is_default AND deleted_at IS NULL', [
         userId,
       ]);
@@ -95,6 +97,11 @@ export async function addBankAccount(userId: number, bankCode: string, accountNu
       });
       return publicBankAccount(row!);
     });
+    log.info(
+      { event: 'bank_account.added', bankAccountId: saved.id, bankCode, account: maskAccount(accountNumber) },
+      'Payout bank account added'
+    );
+    return saved;
   } catch (err: any) {
     if (err?.code === PG_UNIQUE_VIOLATION) throw conflict('This bank account is already saved');
     throw err;
@@ -107,6 +114,7 @@ export async function removeBankAccount(userId: number, id: number) {
     [id, userId]
   );
   if (!res.rowCount) throw notFound('Bank account');
+  log.info({ event: 'bank_account.removed', bankAccountId: id }, 'Payout bank account removed');
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +150,7 @@ export async function requestWithdrawal(
 ) {
   if (user.status !== 'active') throw forbidden(`Account is ${user.status}`, 'ACCOUNT_RESTRICTED');
   if (env.WITHDRAWAL_REQUIRE_KYC && user.kycStatus !== 'verified') {
+    log.info({ event: 'withdrawal.rejected', reason: 'kyc_required', amount }, 'Withdrawal blocked: KYC not verified');
     throw forbidden('Please complete identity verification (KYC) before withdrawing', 'KYC_REQUIRED');
   }
   if (amount < env.MIN_WITHDRAWAL) throw badRequest(`Minimum withdrawal is ${env.MIN_WITHDRAWAL} ${env.CURRENCY}`);
@@ -161,11 +170,15 @@ export async function requestWithdrawal(
     await c.query('SELECT 1 FROM wallets WHERE user_id = $1 FOR UPDATE', [user.id]);
     const today = await queryOne<{ total: string }>(
       c,
-      `SELECT COALESCE(SUM(amount), 0)::text AS total FROM withdrawals
+      `SELECT COALESCE(SUM(amount), 0)::numeric(18,2)::text AS total FROM withdrawals
        WHERE user_id = $1 AND created_at > now() - interval '1 day' AND status NOT IN ('failed', 'reversed', 'rejected')`,
       [user.id]
     );
     if (toMinor(today!.total) + toMinor(amount) > toMinor(env.WITHDRAWAL_DAILY_LIMIT)) {
+      log.warn(
+        { event: 'withdrawal.rejected', reason: 'daily_limit', amount: amountStr, usedToday: today!.total },
+        'Withdrawal blocked: daily limit'
+      );
       throw new AppError('Daily withdrawal limit reached', 422, 'WITHDRAWAL_LIMIT_EXCEEDED');
     }
 
@@ -194,6 +207,10 @@ export async function requestWithdrawal(
     return w!;
   });
 
+  log.info(
+    { event: 'withdrawal.requested', withdrawalId: withdrawal.id, reference: withdrawal.reference, amount: amountStr, needsReview },
+    needsReview ? 'Withdrawal requested — awaiting admin review' : 'Withdrawal requested — sending transfer'
+  );
   if (!needsReview) {
     await processWithdrawal(withdrawal.id);
   }
@@ -210,6 +227,10 @@ async function refundWithdrawal(c: PoolClient, w: WithdrawalRow, status: 'failed
     referenceId: w.id,
     note: `Withdrawal ${status}: ${reason}`.slice(0, 255),
   });
+  log.warn(
+    { event: 'withdrawal.refunded', withdrawalId: w.id, reference: w.reference, ownerId: w.user_id, amount: w.amount, status, reason },
+    `Withdrawal ${status}; ${w.amount} refunded to wallet`
+  );
 }
 
 /**
@@ -239,15 +260,32 @@ export async function processWithdrawal(withdrawalId: number): Promise<void> {
       reason: `${env.APP_NAME} withdrawal`,
       currency: claimed.currency,
     });
+    log.info(
+      {
+        event: 'withdrawal.transfer_sent',
+        withdrawalId: claimed.id,
+        reference: claimed.reference,
+        amount: claimed.amount,
+        transferStatus: transfer.status,
+      },
+      'Paystack transfer initiated'
+    );
     await withTransaction((c) => applyTransferStatus(c, claimed.reference, transfer));
   } catch (err) {
     if (err instanceof PaystackError && err.definitive) {
+      log.error(
+        { event: 'withdrawal.transfer_rejected', withdrawalId: claimed.id, reference: claimed.reference, err: err.message },
+        'Paystack rejected transfer'
+      );
       await withTransaction(async (c) => {
         const w = await queryOne<WithdrawalRow>(c, 'SELECT * FROM withdrawals WHERE id = $1 FOR UPDATE', [claimed.id]);
         if (w && w.status === 'processing') await refundWithdrawal(c, w, 'failed', err.message);
       });
     } else {
-      logger.warn({ err, withdrawalId }, 'Transfer outcome unknown; will reconcile');
+      log.warn(
+        { event: 'withdrawal.outcome_unknown', withdrawalId, reference: claimed.reference, err },
+        'Transfer outcome unknown; funds held, will reconcile'
+      );
     }
   }
 }
@@ -266,6 +304,10 @@ async function applyTransferStatus(c: PoolClient, reference: string, t: Partial<
   switch (t.status) {
     case 'success':
       await c.query(`UPDATE withdrawals SET status = 'success' WHERE id = $1`, [w.id]);
+      log.info(
+        { event: 'withdrawal.succeeded', withdrawalId: w.id, reference, ownerId: w.user_id, amount: w.amount },
+        'Withdrawal paid out'
+      );
       return { status: 'success' };
     case 'failed':
     case 'abandoned':
@@ -277,7 +319,10 @@ async function applyTransferStatus(c: PoolClient, reference: string, t: Partial<
       await refundWithdrawal(c, w, 'reversed', reason || 'Transfer reversed by bank');
       return { status: 'reversed', refunded: true };
     case 'otp':
-      logger.error({ reference }, 'Paystack requires OTP for transfers — disable OTP in the Paystack dashboard for API payouts');
+      log.error(
+        { event: 'withdrawal.otp_required', reference },
+        'Paystack requires OTP for transfers — disable OTP in the Paystack dashboard for API payouts'
+      );
       return { status: 'processing' };
     default:
       return { status: 'processing' };
@@ -307,8 +352,12 @@ export async function reconcileWithdrawals(): Promise<{ checked: number; retried
       if (err instanceof PaystackError && err.httpStatus === 404) {
         // Paystack never received it -> safe to retry with the same reference (idempotent at Paystack).
         await pool.query(`UPDATE withdrawals SET status = 'approved' WHERE id = $1 AND status = 'processing'`, [w.id]);
+        log.info(
+          { event: 'withdrawal.requeued', withdrawalId: w.id, reference: w.reference },
+          'Transfer unknown to Paystack; re-queued with same reference'
+        );
       } else {
-        logger.warn({ err, reference: w.reference }, 'Withdrawal reconciliation failed');
+        log.warn({ event: 'withdrawal.reconcile_error', err, reference: w.reference }, 'Withdrawal reconciliation failed');
       }
     }
   }
@@ -361,6 +410,7 @@ export async function approveWithdrawal(adminId: number, id: number, ip?: string
     await c.query(`UPDATE withdrawals SET status = 'approved', reviewed_by = $2, reviewed_at = now() WHERE id = $1`, [id, adminId]);
     await audit(c, { actorId: adminId, action: 'withdrawal.approve', entityType: 'withdrawal', entityId: id, ip });
   });
+  log.info({ event: 'withdrawal.approved', withdrawalId: id }, 'Withdrawal approved by admin');
   await processWithdrawal(id);
   return queryOne<WithdrawalRow>(pool, 'SELECT * FROM withdrawals WHERE id = $1', [id]);
 }
@@ -373,6 +423,7 @@ export async function rejectWithdrawal(adminId: number, id: number, reason: stri
     await c.query('UPDATE withdrawals SET reviewed_by = $2, reviewed_at = now() WHERE id = $1', [id, adminId]);
     await refundWithdrawal(c, w, 'rejected', reason);
     await audit(c, { actorId: adminId, action: 'withdrawal.reject', entityType: 'withdrawal', entityId: id, metadata: { reason }, ip });
+    log.info({ event: 'withdrawal.rejected_by_admin', withdrawalId: id, reason }, 'Withdrawal rejected by admin');
     return queryOne<WithdrawalRow>(c, 'SELECT * FROM withdrawals WHERE id = $1', [id]);
   });
 }

@@ -116,7 +116,9 @@ export async function featuredBoard(perLeague = 5) {
 export async function getEventDetail(eventId: number, db: Queryable = pool) {
   const event = await queryOne(
     db,
-    `SELECT e.*, l.slug AS league_slug, l.name AS league_name, l.country, s.slug AS sport
+    `SELECT e.id, e.league_id, e.home_team, e.away_team, e.start_time, e.status, e.home_score, e.away_score,
+            e.ht_home_score, e.ht_away_score, e.is_featured,
+            l.slug AS league_slug, l.name AS league_name, l.country, s.slug AS sport
      FROM events e JOIN leagues l ON l.id = e.league_id JOIN sports s ON s.id = l.sport_id WHERE e.id = $1`,
     [eventId]
   );

@@ -30,9 +30,18 @@ const schema = z.object({
   APP_BASE_URL: z.string().url().default('http://localhost:4000'),
   FRONTEND_URL: z.string().url().default('http://localhost:3000'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
+  // Pretty, human-readable logs. Defaults to true outside production, JSON in production.
+  LOG_PRETTY: z.enum(['true', 'false', '1', '0', 'yes', 'no']).optional(),
+  // Optional extra JSON log file sink, e.g. /var/log/sportsbook/app.log
+  LOG_FILE: z.string().optional(),
+  // Log request/response timing for /health, /ready and /metrics too (noisy).
+  LOG_PROBES: bool(false),
   TRUST_PROXY: z.string().default('loopback'),
   CORS_ORIGINS: csv,
   DOCS_ENABLED: bool(true),
+  // If both are set, /docs requires HTTP Basic auth (recommended in production).
+  DOCS_USERNAME: z.string().optional(),
+  DOCS_PASSWORD: z.string().optional(),
   METRICS_TOKEN: z.string().optional(),
 
   // PostgreSQL
@@ -133,6 +142,7 @@ export const env = Object.freeze({
   ...e,
   isProduction: e.NODE_ENV === 'production',
   isTest: e.NODE_ENV === 'test',
+  LOG_PRETTY: e.LOG_PRETTY === undefined ? e.NODE_ENV !== 'production' : ['true', '1', 'yes'].includes(e.LOG_PRETTY),
   paystackWebhookIps: e.PAYSTACK_WEBHOOK_IPS.split(',')
     .map((s) => s.trim())
     .filter(Boolean),
