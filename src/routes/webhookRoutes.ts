@@ -1,10 +1,12 @@
 import { Router } from 'express';
 import { env } from '../config/env';
-import { logger } from '../config/logger';
+import { createLogger } from '../config/logger';
 import { asyncHandler } from '../lib/http';
 import { forbidden } from '../lib/errors';
 import { webhookLimiter } from '../middleware/rateLimit';
 import { handlePaystackWebhook } from '../services/paymentService';
+
+const logger = createLogger('webhooks');
 
 const router = Router();
 
@@ -18,11 +20,14 @@ router.post(
   webhookLimiter,
   asyncHandler(async (req, res) => {
     if (env.PAYSTACK_ENFORCE_IP_WHITELIST && !env.paystackWebhookIps.includes((req.ip || '').replace(/^::ffff:/, ''))) {
-      logger.warn({ ip: req.ip }, 'Rejected Paystack webhook from non-whitelisted IP');
+      logger.warn({ event: 'webhook.ip_rejected', ip: req.ip }, 'Rejected Paystack webhook from non-whitelisted IP');
       throw forbidden('Source IP not allowed');
     }
     const result = await handlePaystackWebhook(req.rawBody, req.headers['x-paystack-signature']);
-    logger.info({ event: req.body?.event, reference: req.body?.data?.reference, result }, 'Paystack webhook processed');
+    logger.debug(
+      { event: 'webhook.processed', type: req.body?.event, reference: req.body?.data?.reference, result },
+      'Paystack webhook processed'
+    );
     res.status(200).json({ received: true });
   })
 );

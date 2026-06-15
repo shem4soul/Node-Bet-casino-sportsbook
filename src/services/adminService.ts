@@ -27,14 +27,19 @@ export async function getUser(id: number) {
   const stats = await queryOne(
     pool,
     `SELECT
-       (SELECT COALESCE(SUM(amount),0) FROM payment_intents WHERE user_id = $1 AND status = 'success')::text AS total_deposits,
-       (SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE user_id = $1 AND status = 'success')::text AS total_withdrawals,
+       (SELECT COALESCE(SUM(amount),0) FROM payment_intents WHERE user_id = $1 AND status = 'success')::numeric(18,2)::text AS total_deposits,
+       (SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE user_id = $1 AND status = 'success')::numeric(18,2)::text AS total_withdrawals,
        (SELECT COUNT(*) FROM bet_slips WHERE user_id = $1) AS bets_placed,
-       (SELECT COALESCE(SUM(stake),0) FROM bet_slips WHERE user_id = $1)::text AS total_staked,
-       (SELECT COALESCE(SUM(payout),0) FROM bet_slips WHERE user_id = $1)::text AS total_returned`,
+       (SELECT COALESCE(SUM(stake),0) FROM bet_slips WHERE user_id = $1)::numeric(18,2)::text AS total_staked,
+       (SELECT COALESCE(SUM(payout),0) FROM bet_slips WHERE user_id = $1)::numeric(18,2)::text AS total_returned`,
     [id]
   );
-  return { ...publicUser(u), lastLoginAt: u.last_login_at, wallet, stats };
+  return {
+    ...publicUser(u),
+    lastLoginAt: u.last_login_at,
+    wallet: wallet ? { balance: wallet.balance, currency: wallet.currency } : null,
+    stats,
+  };
 }
 
 export async function setUserStatus(actorId: number, id: number, status: UserStatus, reason: string, ip?: string | null) {
@@ -80,14 +85,14 @@ export async function summaryReport(from: Date, to: Date) {
   const r = await queryOne(
     pool,
     `SELECT
-       COALESCE(SUM(-amount) FILTER (WHERE type = 'bet_stake'), 0)::text AS sports_stakes,
-       COALESCE(SUM(amount)  FILTER (WHERE type IN ('bet_payout', 'bet_void_refund', 'bet_cashout')), 0)::text AS sports_payouts,
-       COALESCE(SUM(-amount) FILTER (WHERE type = 'game_stake'), 0)::text AS casino_stakes,
-       COALESCE(SUM(amount)  FILTER (WHERE type = 'game_payout'), 0)::text AS casino_payouts,
-       COALESCE(SUM(amount)  FILTER (WHERE type = 'deposit'), 0)::text AS deposits,
-       COALESCE(SUM(-amount) FILTER (WHERE type = 'withdrawal'), 0)::text AS withdrawals_requested,
-       COALESCE(SUM(amount)  FILTER (WHERE type = 'withdrawal_reversal'), 0)::text AS withdrawals_reversed,
-       COALESCE(SUM(amount)  FILTER (WHERE type = 'adjustment'), 0)::text AS adjustments,
+       COALESCE(SUM(-amount) FILTER (WHERE type = 'bet_stake'), 0)::numeric(18,2)::text AS sports_stakes,
+       COALESCE(SUM(amount)  FILTER (WHERE type IN ('bet_payout', 'bet_void_refund', 'bet_cashout')), 0)::numeric(18,2)::text AS sports_payouts,
+       COALESCE(SUM(-amount) FILTER (WHERE type = 'game_stake'), 0)::numeric(18,2)::text AS casino_stakes,
+       COALESCE(SUM(amount)  FILTER (WHERE type = 'game_payout'), 0)::numeric(18,2)::text AS casino_payouts,
+       COALESCE(SUM(amount)  FILTER (WHERE type = 'deposit'), 0)::numeric(18,2)::text AS deposits,
+       COALESCE(SUM(-amount) FILTER (WHERE type = 'withdrawal'), 0)::numeric(18,2)::text AS withdrawals_requested,
+       COALESCE(SUM(amount)  FILTER (WHERE type = 'withdrawal_reversal'), 0)::numeric(18,2)::text AS withdrawals_reversed,
+       COALESCE(SUM(amount)  FILTER (WHERE type = 'adjustment'), 0)::numeric(18,2)::text AS adjustments,
        COUNT(DISTINCT user_id) AS active_users
      FROM transactions WHERE created_at >= $1 AND created_at < $2`,
     [from, to]
@@ -98,8 +103,8 @@ export async function summaryReport(from: Date, to: Date) {
        (SELECT COUNT(*) FROM users WHERE created_at >= $1 AND created_at < $2) AS new_users,
        (SELECT COUNT(*) FROM bet_slips WHERE created_at >= $1 AND created_at < $2) AS bets_placed,
        (SELECT COUNT(DISTINCT user_id) FROM payment_intents WHERE status = 'success' AND paid_at >= $1 AND paid_at < $2) AS depositors,
-       (SELECT COALESCE(SUM(balance),0) FROM wallets)::text AS total_customer_balances,
-       (SELECT COALESCE(SUM(potential_payout),0) FROM bet_slips WHERE status = 'pending')::text AS open_bet_liability`,
+       (SELECT COALESCE(SUM(balance),0) FROM wallets)::numeric(18,2)::text AS total_customer_balances,
+       (SELECT COALESCE(SUM(potential_payout),0) FROM bet_slips WHERE status = 'pending')::numeric(18,2)::text AS open_bet_liability`,
     [from, to]
   );
   const sportsGgr = fromMinor(toMinor(r.sports_stakes) - toMinor(r.sports_payouts));

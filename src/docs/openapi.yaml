@@ -3,27 +3,58 @@ info:
   title: Naija Sportsbook API
   version: 2.0.0
   description: |
-    Sportsbook + casino backend for Nigeria-facing operators: EPL, LaLiga, NPFL and other
-    football leagues, Paystack deposits and payouts, PostgreSQL ledger.
+    Sportsbook + casino backend for Nigeria-facing operators: **English Premier League, LaLiga, NPFL**
+    and other football leagues, **Paystack** deposits and payouts, PostgreSQL ledger.
 
-    **Auth**: `Authorization: Bearer <accessToken>`. Access tokens are short-lived (15 min by
-    default); exchange the refresh token at `POST /auth/refresh` (rotating, single use).
+    ## Getting started
+    1. `POST /auth/register` (or `/auth/login`) → copy `accessToken`.
+    2. Click **Authorize** (top right) and paste it — Swagger UI remembers it across reloads.
+    3. Browse fixtures with `GET /sports/featured`, then `POST /sports/bets`.
 
-    **Money**: all amounts are NGN decimal strings with 2 dp in responses (e.g. `"1500.00"`)
-    and JSON numbers in requests.
+    ## Conventions
+    | Topic | Rule |
+    | --- | --- |
+    | Auth | `Authorization: Bearer <accessToken>`. Access tokens last 15 min; rotate with `POST /auth/refresh` (single-use refresh tokens). |
+    | Money | Responses: NGN decimal **strings**, 2 dp (`"1500.00"`). Requests: JSON numbers (`1500`). |
+    | Odds | Decimal odds as strings with 3 dp (`"1.950"`). |
+    | Pagination | `limit` (1–100, default 20) and `offset`. |
+    | Tracing | Send `X-Request-Id` to correlate with server logs; every response echoes it, and errors include it as `error.requestId`. |
+    | Retries | `POST /sports/bets` accepts an `Idempotency-Key` header. |
+    | Rate limits | Standard `RateLimit` / `RateLimit-Policy` headers; `429` with code `RATE_LIMITED`. |
 
-    **Errors**: `{ "error": { "code": "INSUFFICIENT_FUNDS", "message": "...", "details": ..., "requestId": "..." } }`
+    ## Errors
+    Every error has the same shape — branch on `error.code`, not on the message:
+    ```json
+    { "error": { "code": "INSUFFICIENT_FUNDS", "message": "Insufficient balance", "requestId": "3f2c…" } }
+    ```
+  contact:
+    name: API support
+  license:
+    name: Proprietary
 servers:
   - url: /api/v1
 tags:
   - name: Auth
+    description: Registration, login, sessions, password reset.
   - name: Account
+    description: Profile and responsible-gambling controls.
   - name: Wallet
+    description: Balance, ledger, Paystack deposits, bank accounts and withdrawals.
   - name: Sports
+    description: Public catalogue — leagues, fixtures, markets and odds.
   - name: Bets
+    description: Bet placement, history, cash-out and booking codes.
   - name: Casino
-  - name: Admin
+    description: Provably-fair dice, coin flip and slots.
   - name: Webhooks
+    description: Inbound provider callbacks.
+  - name: Admin
+    description: Back office (requires an admin account).
+  - name: Operations
+    description: Health, readiness and metrics (served at the root, not under /api/v1).
+
+security:
+  - bearer: []
 
 components:
   securitySchemes:
@@ -31,80 +62,374 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
+      description: Access token from `/auth/login`, `/auth/register` or `/auth/refresh`.
+
   parameters:
-    limit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
-    offset: { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
-    id: { name: id, in: path, required: true, schema: { type: integer } }
+    limit: { name: limit, in: query, description: Page size, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+    offset: { name: offset, in: query, description: Items to skip, schema: { type: integer, minimum: 0, default: 0 } }
+    id: { name: id, in: path, required: true, schema: { type: integer, minimum: 1 }, example: 1 }
+    reference: { name: reference, in: path, required: true, description: Paystack/payment reference, schema: { type: string }, example: dep_4f1c9b2e7d8a4a51b2c3d4e5f6a7b8c9 }
+    requestId: { name: X-Request-Id, in: header, required: false, description: Optional correlation id (8–128 chars), schema: { type: string } }
+
+  headers:
+    X-Request-Id: { description: Correlation id for this request (matches server logs), schema: { type: string } }
+
+  responses:
+    BadRequest:
+      description: Invalid input or business-rule violation
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            validation:
+              summary: Validation error
+              value: { error: { code: VALIDATION_ERROR, message: Request validation failed, details: [{ path: stake, message: Number must be greater than 0 }], requestId: 0b7d3c4e-1a2b-4c5d-8e9f-0a1b2c3d4e5f } }
+            insufficient:
+              summary: Not enough balance
+              value: { error: { code: INSUFFICIENT_FUNDS, message: Insufficient balance, requestId: 0b7d3c4e-1a2b-4c5d-8e9f-0a1b2c3d4e5f } }
+    Unauthorized:
+      description: Missing, invalid or expired credentials
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: TOKEN_INVALID, message: Invalid or expired access token, requestId: 0b7d3c4e-1a2b-4c5d-8e9f-0a1b2c3d4e5f } }
+    Forbidden:
+      description: Authenticated but not allowed (role, account status, self-exclusion, KYC)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: SELF_EXCLUDED, message: You are self-excluded until 2026-12-01T00:00:00.000Z, requestId: 0b7d3c4e-1a2b-4c5d-8e9f-0a1b2c3d4e5f } }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: NOT_FOUND, message: Bet not found, requestId: 0b7d3c4e-1a2b-4c5d-8e9f-0a1b2c3d4e5f } }
+    Conflict:
+      description: State conflict (already settled, odds changed, duplicate, ...)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unprocessable:
+      description: Responsible-gambling or payout limit exceeded
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: DEPOSIT_LIMIT_EXCEEDED, message: 'This deposit exceeds your daily deposit limit. Remaining: 1000.00', details: { period: daily, limit: '3000.00', used: '2000.00' }, requestId: 0b7d3c4e-1a2b-4c5d-8e9f-0a1b2c3d4e5f } }
+    TooManyRequests:
+      description: Rate limited or account temporarily locked
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: RATE_LIMITED, message: 'Too many requests, please slow down.' } }
+    BadGateway:
+      description: Payment or odds provider error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: PAYMENT_PROVIDER_ERROR, message: Payment provider unreachable, requestId: 0b7d3c4e-1a2b-4c5d-8e9f-0a1b2c3d4e5f } }
+    NoContent:
+      description: Done (no body)
+
   schemas:
-    Money: { type: string, example: '1500.00' }
+    # ------------------------------------------------------------ primitives
+    Money: { type: string, pattern: '^-?\d+\.\d{2}$', example: '1500.00', description: 'NGN amount, 2 decimal places' }
+    Odds: { type: string, pattern: '^\d+\.\d{3}$', example: '1.950', description: Decimal odds }
+    Timestamp: { type: string, format: date-time, example: '2026-11-01T15:00:00.000Z' }
+
     Error:
       type: object
+      required: [error]
       properties:
         error:
           type: object
+          required: [code, message]
           properties:
-            code: { type: string, example: INSUFFICIENT_FUNDS }
-            message: { type: string }
-            details: {}
-            requestId: { type: string }
+            code:
+              type: string
+              description: Stable machine-readable code
+              example: INSUFFICIENT_FUNDS
+              enum:
+                [VALIDATION_ERROR, INVALID_JSON, PAYLOAD_TOO_LARGE, BAD_REQUEST, UNAUTHORIZED, FORBIDDEN, NOT_FOUND, CONFLICT, RATE_LIMITED,
+                 INTERNAL_ERROR, BAD_GATEWAY, SERVICE_UNAVAILABLE, DUPLICATE, INVALID_REFERENCE, CONSTRAINT_VIOLATION,
+                 TOKEN_MISSING, TOKEN_INVALID, ACCOUNT_DISABLED, ACCOUNT_RESTRICTED, SELF_EXCLUDED, UNDERAGE, ACCOUNT_EXISTS,
+                 INVALID_CREDENTIALS, ACCOUNT_LOCKED, REFRESH_INVALID, REFRESH_EXPIRED, REFRESH_REUSED, RESET_TOKEN_INVALID,
+                 INSUFFICIENT_FUNDS, STAKE_TOO_LOW, STAKE_TOO_HIGH, TOO_MANY_SELECTIONS, SAME_EVENT_SELECTIONS, SELECTIONS_UNAVAILABLE,
+                 ODDS_CHANGED, MAX_PAYOUT_EXCEEDED, CASHOUT_UNAVAILABLE, CASHOUT_CHANGED, INVALID_MARKET,
+                 DEPOSIT_TOO_SMALL, DEPOSIT_TOO_LARGE, DEPOSIT_LIMIT_EXCEEDED, PAYMENTS_DISABLED, PAYMENT_PROVIDER_ERROR, INVALID_SIGNATURE,
+                 KYC_REQUIRED, WITHDRAWAL_LIMIT_EXCEEDED, ACCOUNT_UNRESOLVED, TOO_MANY_BANK_ACCOUNTS, ODDS_FEED_DISABLED, ODDS_FEED_ERROR, ERROR]
+            message: { type: string, example: Insufficient balance }
+            details: { description: 'Extra context, e.g. validation issues or changed odds' }
+            requestId: { type: string, description: Same as the X-Request-Id response header }
+
+    Message:
+      type: object
+      properties: { message: { type: string } }
+
+    # ------------------------------------------------------------ auth & account
+    RegisterRequest:
+      type: object
+      required: [username, email, password, dateOfBirth]
+      properties:
+        username: { type: string, pattern: '^[A-Za-z0-9_]{3,32}$', example: chidi_o }
+        email: { type: string, format: email, example: chidi@example.com }
+        password: { type: string, minLength: 8, maxLength: 128, description: At least one letter and one digit, example: Passw0rd! }
+        dateOfBirth: { type: string, format: date, description: Must be 18+, example: '1995-04-02' }
+        phone: { type: string, pattern: '^\+?[0-9]{10,15}$', example: '+2348012345678' }
+        firstName: { type: string, example: Chidi }
+        lastName: { type: string, example: Okafor }
+    LoginRequest:
+      type: object
+      required: [identifier, password]
+      properties:
+        identifier: { type: string, description: 'Email, username or phone', example: chidi@example.com }
+        password: { type: string, example: Passw0rd! }
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      properties: { refreshToken: { type: string, example: 3q2-7wEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA } }
+    TokenPair:
+      type: object
+      required: [accessToken, refreshToken, tokenType, expiresIn]
+      properties:
+        accessToken: { type: string, example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9... }
+        refreshToken: { type: string, description: 'Opaque, single-use. Store securely.' }
+        tokenType: { type: string, enum: [Bearer] }
+        expiresIn: { type: string, example: 15m }
     User:
       type: object
+      required: [id, username, email, role, kycStatus, status]
       properties:
-        id: { type: integer }
-        username: { type: string }
-        email: { type: string }
-        phone: { type: string, nullable: true }
+        id: { type: integer, example: 42 }
+        username: { type: string, example: chidi_o }
+        email: { type: string, example: chidi@example.com }
+        phone: { type: string, nullable: true, example: '+2348012345678' }
+        firstName: { type: string, nullable: true }
+        lastName: { type: string, nullable: true }
         role: { type: string, enum: [user, admin] }
         kycStatus: { type: string, enum: [unverified, pending, verified, rejected] }
         status: { type: string, enum: [active, suspended, banned, closed] }
-        selfExclusionUntil: { type: string, format: date-time, nullable: true }
+        selfExclusionUntil: { allOf: [{ $ref: '#/components/schemas/Timestamp' }], nullable: true }
+        createdAt: { $ref: '#/components/schemas/Timestamp' }
     AuthResponse:
+      allOf:
+        - $ref: '#/components/schemas/TokenPair'
+        - type: object
+          required: [user]
+          properties: { user: { $ref: '#/components/schemas/User' } }
+    Profile:
+      allOf:
+        - $ref: '#/components/schemas/User'
+        - type: object
+          properties:
+            wallet:
+              type: object
+              nullable: true
+              properties:
+                balance: { $ref: '#/components/schemas/Money' }
+                currency: { type: string, example: NGN }
+    ProfileUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        firstName: { type: string }
+        lastName: { type: string }
+        phone: { type: string, pattern: '^\+?[0-9]{10,15}$' }
+    ChangePasswordRequest:
+      type: object
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword: { type: string }
+        newPassword: { type: string, minLength: 8 }
+    DepositLimits:
       type: object
       properties:
-        user: { $ref: '#/components/schemas/User' }
-        accessToken: { type: string }
-        refreshToken: { type: string }
-        tokenType: { type: string, example: Bearer }
-        expiresIn: { type: string, example: 15m }
-    Tokens:
+        deposit:
+          type: array
+          items:
+            type: object
+            properties:
+              period: { type: string, enum: [daily, weekly, monthly] }
+              limit: { allOf: [{ $ref: '#/components/schemas/Money' }], nullable: true }
+              used: { $ref: '#/components/schemas/Money' }
+              pendingLimit: { allOf: [{ $ref: '#/components/schemas/Money' }], nullable: true, description: Increase waiting for the cooling-off period }
+              pendingRemoval: { type: boolean }
+              pendingEffectiveAt: { allOf: [{ $ref: '#/components/schemas/Timestamp' }], nullable: true }
+    SetDepositLimitRequest:
+      type: object
+      required: [period, amount]
+      properties:
+        period: { type: string, enum: [daily, weekly, monthly] }
+        amount: { type: number, nullable: true, description: null removes the limit (after the cooling-off period), example: 20000 }
+    SetDepositLimitResult:
       type: object
       properties:
-        accessToken: { type: string }
-        refreshToken: { type: string }
-        tokenType: { type: string }
-        expiresIn: { type: string }
+        period: { type: string, enum: [daily, weekly, monthly] }
+        limit: { allOf: [{ $ref: '#/components/schemas/Money' }], nullable: true }
+        effect: { type: string, enum: [immediate, scheduled], description: Lowering applies now; raising/removing is scheduled }
+        coolingOffHours: { type: integer, example: 24 }
+    SelfExclusionRequest:
+      type: object
+      required: [days, confirm]
+      properties:
+        days: { type: integer, minimum: 1, maximum: 3650, example: 30 }
+        confirm: { type: boolean, enum: [true] }
+    SelfExclusionResult:
+      type: object
+      properties: { selfExclusionUntil: { $ref: '#/components/schemas/Timestamp' } }
+
+    # ------------------------------------------------------------ wallet & payments
+    Wallet:
+      type: object
+      required: [balance, currency]
+      properties:
+        balance: { $ref: '#/components/schemas/Money' }
+        currency: { type: string, example: NGN }
+        updatedAt: { $ref: '#/components/schemas/Timestamp' }
+    Transaction:
+      type: object
+      required: [id, type, amount, balance_after, created_at]
+      properties:
+        id: { type: integer }
+        user_id: { type: integer }
+        type: { type: string, enum: [deposit, withdrawal, withdrawal_reversal, bet_stake, bet_payout, bet_void_refund, bet_cashout, game_stake, game_payout, adjustment] }
+        amount: { type: string, description: 'Positive = credit, negative = debit', example: '-1000.00' }
+        balance_after: { $ref: '#/components/schemas/Money' }
+        reference_type: { type: string, nullable: true, example: bet_slip }
+        reference_id: { type: integer, nullable: true, example: 17 }
+        note: { type: string, nullable: true }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+    DepositRequest:
+      type: object
+      required: [amount]
+      properties: { amount: { type: number, minimum: 100, example: 5000, description: 'NGN, between MIN_DEPOSIT and MAX_DEPOSIT' } }
+    DepositInit:
+      type: object
+      required: [reference, amount, currency, authorizationUrl, accessCode]
+      properties:
+        reference: { type: string, example: dep_4f1c9b2e7d8a4a51b2c3d4e5f6a7b8c9 }
+        amount: { $ref: '#/components/schemas/Money' }
+        currency: { type: string, example: NGN }
+        authorizationUrl: { type: string, format: uri, description: Redirect the customer here, example: 'https://checkout.paystack.com/0peioxfhpn' }
+        accessCode: { type: string, description: For Paystack Inline / Popup }
+        publicKey: { type: string, description: Your Paystack public key (if configured) }
+    Deposit:
+      type: object
+      required: [reference, amount, currency, status]
+      properties:
+        reference: { type: string }
+        amount: { $ref: '#/components/schemas/Money' }
+        currency: { type: string }
+        status: { type: string, enum: [pending, success, failed, abandoned] }
+        channel: { type: string, nullable: true, example: card }
+        authorizationUrl: { type: string, nullable: true, description: Only while pending }
+        paidAt: { allOf: [{ $ref: '#/components/schemas/Timestamp' }], nullable: true }
+        createdAt: { $ref: '#/components/schemas/Timestamp' }
+    Bank:
+      type: object
+      properties:
+        name: { type: string, example: Guaranty Trust Bank }
+        code: { type: string, example: '058' }
+        slug: { type: string, example: guaranty-trust-bank }
+    AddBankAccountRequest:
+      type: object
+      required: [bankCode, accountNumber]
+      properties:
+        bankCode: { type: string, example: '058' }
+        accountNumber: { type: string, pattern: '^\d{10}$', example: '0123456789' }
+    BankAccount:
+      type: object
+      required: [id, bankCode, bankName, accountNumber, accountName, isDefault]
+      properties:
+        id: { type: integer }
+        bankCode: { type: string, example: '058' }
+        bankName: { type: string, example: Guaranty Trust Bank }
+        accountNumber: { type: string, example: '0123456789' }
+        accountName: { type: string, description: As resolved by Paystack, example: CHIDI OKAFOR }
+        isDefault: { type: boolean }
+        createdAt: { $ref: '#/components/schemas/Timestamp' }
+    WithdrawalRequest:
+      type: object
+      required: [amount, bankAccountId]
+      properties:
+        amount: { type: number, example: 20000 }
+        bankAccountId: { type: integer, example: 1 }
+    Withdrawal:
+      type: object
+      required: [id, amount, currency, status, reference]
+      properties:
+        id: { type: integer }
+        amount: { $ref: '#/components/schemas/Money' }
+        currency: { type: string }
+        status:
+          type: string
+          enum: [pending_review, approved, processing, success, failed, reversed, rejected]
+          description: |
+            `pending_review` (large amounts) → `approved` → `processing` (sent to Paystack) → `success`.
+            `failed` / `reversed` / `rejected` are refunded to the wallet automatically.
+        reference: { type: string, example: wd_9b2c4d6e8f0a1b3c5d7e9f1a2b4c6d8e }
+        failureReason: { type: string, nullable: true }
+        bankAccountId: { type: integer }
+        bankName: { type: string }
+        accountNumber: { type: string, description: Masked, example: '******6789' }
+        createdAt: { $ref: '#/components/schemas/Timestamp' }
+        updatedAt: { $ref: '#/components/schemas/Timestamp' }
+
+    # ------------------------------------------------------------ sports catalogue
+    Sport:
+      type: object
+      properties:
+        id: { type: integer }
+        slug: { type: string, example: football }
+        name: { type: string, example: Football }
+        is_active: { type: boolean, description: Admin responses only }
+        sort_order: { type: integer, description: Admin responses only }
     League:
       type: object
+      required: [id, slug, name, sport]
       properties:
         id: { type: integer }
         slug: { type: string, example: npfl }
         name: { type: string, example: Nigeria Premier Football League }
-        short_name: { type: string, example: NPFL }
-        country: { type: string, example: Nigeria }
+        short_name: { type: string, nullable: true, example: NPFL }
+        country: { type: string, nullable: true, example: Nigeria }
+        country_code: { type: string, nullable: true, example: NG }
         is_featured: { type: boolean }
-        upcoming_events: { type: integer }
+        sport: { type: string, example: football }
+        upcoming_events: { type: integer, example: 9 }
+    OddsQuote:
+      type: object
+      required: [oddsId, selection, price]
+      properties:
+        oddsId: { type: integer, example: 146 }
+        selection: { type: string, example: HOME }
+        price: { $ref: '#/components/schemas/Odds' }
     EventSummary:
       type: object
+      required: [id, home_team, away_team, start_time, status, league_slug]
       properties:
-        id: { type: integer }
+        id: { type: integer, example: 6 }
         home_team: { type: string, example: Enyimba }
         away_team: { type: string, example: Kano Pillars }
-        start_time: { type: string, format: date-time }
+        start_time: { $ref: '#/components/schemas/Timestamp' }
         status: { type: string, enum: [scheduled, live, finished, cancelled, postponed] }
-        league_slug: { type: string }
+        home_score: { type: integer, nullable: true }
+        away_score: { type: integer, nullable: true }
+        is_featured: { type: boolean }
+        league_slug: { type: string, example: npfl }
+        league_name: { type: string, example: Nigeria Premier Football League }
+        country: { type: string, nullable: true }
+        sport: { type: string, example: football }
+        main_market_id: { type: integer, nullable: true }
         main_odds:
           type: array
           nullable: true
-          items: { $ref: '#/components/schemas/OddsCompact' }
-        open_markets: { type: integer }
-    OddsCompact:
-      type: object
-      properties:
-        oddsId: { type: integer }
-        selection: { type: string, example: HOME }
-        price: { type: string, example: '1.750' }
+          description: Headline 1X2 prices (HOME, DRAW, AWAY), or null if no open 1X2 market
+          items: { $ref: '#/components/schemas/OddsQuote' }
+        open_markets: { type: integer, example: 10 }
     Market:
       type: object
+      required: [id, type, name, status, odds]
       properties:
         id: { type: integer }
         type: { type: string, example: OVER_UNDER }
@@ -115,28 +440,96 @@ components:
           type: array
           items:
             type: object
+            required: [oddsId, selection, price, active, result]
             properties:
               oddsId: { type: integer }
-              selection: { type: string }
-              price: { type: string }
+              selection: { type: string, example: OVER }
+              price: { $ref: '#/components/schemas/Odds' }
               active: { type: boolean }
               result: { type: string, enum: [pending, won, lost, void] }
     EventDetail:
-      allOf:
-        - $ref: '#/components/schemas/EventSummary'
-        - type: object
-          properties:
-            markets: { type: array, items: { $ref: '#/components/schemas/Market' } }
-    BetSlip:
       type: object
+      required: [id, home_team, away_team, start_time, status, markets]
       properties:
         id: { type: integer }
+        home_team: { type: string }
+        away_team: { type: string }
+        start_time: { $ref: '#/components/schemas/Timestamp' }
+        status: { type: string, enum: [scheduled, live, finished, cancelled, postponed] }
+        home_score: { type: integer, nullable: true }
+        away_score: { type: integer, nullable: true }
+        ht_home_score: { type: integer, nullable: true }
+        ht_away_score: { type: integer, nullable: true }
+        is_featured: { type: boolean }
+        league_id: { type: integer }
+        league_slug: { type: string }
+        league_name: { type: string }
+        country: { type: string, nullable: true }
+        sport: { type: string }
+        markets: { type: array, items: { $ref: '#/components/schemas/Market' } }
+    FeaturedLeague:
+      type: object
+      properties:
+        league:
+          type: object
+          properties:
+            slug: { type: string, example: premier-league }
+            name: { type: string, example: English Premier League }
+            shortName: { type: string, nullable: true, example: EPL }
+            country: { type: string, nullable: true, example: England }
+        events: { type: array, items: { $ref: '#/components/schemas/EventSummary' } }
+    MarketDefinition:
+      type: object
+      properties:
+        type: { type: string, example: DRAW_NO_BET }
+        name: { type: string, example: Draw No Bet }
+        requiresLine: { type: boolean }
+        needsHalfTime: { type: boolean }
+        selections:
+          oneOf:
+            - type: array
+              items: { type: string }
+            - type: string
+          example: [HOME, AWAY]
+
+    # ------------------------------------------------------------ bets
+    PlaceBetRequest:
+      type: object
+      required: [stake, selections]
+      properties:
+        stake: { type: number, example: 1000, description: 'NGN, MIN_STAKE..MAX_STAKE' }
+        selections:
+          type: array
+          minItems: 1
+          maxItems: 40
+          description: One selection per match. 1 = single, 2+ = accumulator.
+          items:
+            type: object
+            required: [oddsId]
+            properties:
+              oddsId: { type: integer, example: 146 }
+              price: { type: number, description: The price the user saw — used to detect odds movement, example: 1.75 }
+        acceptOddsChanges:
+          type: string
+          enum: [none, higher, any]
+          default: higher
+          description: '`none` rejects any change, `higher` accepts improvements only, `any` accepts the current price'
+        bookingCode: { type: string, description: Booking code this slip was loaded from (for attribution) }
+    BetSlip:
+      type: object
+      required: [id, betType, stake, totalOdds, potentialPayout, status, selections]
+      properties:
+        id: { type: integer, example: 17 }
         betType: { type: string, enum: [single, multi] }
         stake: { $ref: '#/components/schemas/Money' }
         totalOdds: { type: string, example: '6.840' }
         potentialPayout: { $ref: '#/components/schemas/Money' }
-        payout: { type: string, nullable: true }
+        payout: { allOf: [{ $ref: '#/components/schemas/Money' }], nullable: true, description: Set once settled or cashed out }
         status: { type: string, enum: [pending, won, lost, void, cashed_out] }
+        bookingCode: { type: string, nullable: true }
+        createdAt: { $ref: '#/components/schemas/Timestamp' }
+        settledAt: { allOf: [{ $ref: '#/components/schemas/Timestamp' }], nullable: true }
+        idempotentReplay: { type: boolean, description: 'Present (true) when an Idempotency-Key matched an existing slip' }
         selections:
           type: array
           items:
@@ -145,610 +538,1462 @@ components:
               oddsId: { type: integer }
               eventId: { type: integer }
               match: { type: string, example: Arsenal vs Chelsea }
+              league: { type: string, example: English Premier League }
+              startTime: { $ref: '#/components/schemas/Timestamp' }
+              marketType: { type: string, example: 1X2 }
+              line: { type: string, nullable: true }
+              selection: { type: string, example: HOME }
+              price: { $ref: '#/components/schemas/Odds' }
+              result: { type: string, enum: [pending, won, lost, void] }
+    CashoutQuote:
+      type: object
+      required: [betId, available]
+      properties:
+        betId: { type: integer }
+        available: { type: boolean }
+        amount: { $ref: '#/components/schemas/Money' }
+        reason: { type: string, example: One or more selections are suspended or in play }
+    CashoutRequest:
+      type: object
+      properties: { expectedAmount: { type: number, description: Reject if the value has dropped below this, example: 1187.5 } }
+    CashoutResult:
+      type: object
+      properties:
+        betId: { type: integer }
+        cashedOut: { $ref: '#/components/schemas/Money' }
+        balance: { $ref: '#/components/schemas/Money' }
+    BookingCodeRequest:
+      type: object
+      required: [oddsIds]
+      properties: { oddsIds: { type: array, items: { type: integer }, example: [146, 212] } }
+    BookingCodeCreated:
+      type: object
+      properties:
+        code: { type: string, example: NB7K2QX }
+        selections: { type: integer, example: 2 }
+    BookingCodeDetail:
+      type: object
+      properties:
+        code: { type: string, example: NB7K2QX }
+        expiresAt: { $ref: '#/components/schemas/Timestamp' }
+        totalOdds: { type: string, nullable: true, description: Product of currently available selections, example: '4.000' }
+        selections:
+          type: array
+          items:
+            type: object
+            properties:
+              oddsId: { type: integer }
+              eventId: { type: integer }
+              match: { type: string }
+              startTime: { $ref: '#/components/schemas/Timestamp' }
               marketType: { type: string }
               line: { type: string, nullable: true }
               selection: { type: string }
-              price: { type: string }
-              result: { type: string }
+              price: { $ref: '#/components/schemas/Odds' }
+              available: { type: boolean, description: false if suspended or kicked off }
+
+    # ------------------------------------------------------------ casino
+    Game:
+      type: object
+      properties:
+        slug: { type: string, example: dice }
+        name: { type: string, example: Dice }
+        type: { type: string, enum: [dice, coinflip, slots] }
+        rtp_percent: { type: string, example: '98.00' }
+        min_bet: { $ref: '#/components/schemas/Money' }
+        max_bet: { $ref: '#/components/schemas/Money' }
+    FairnessState:
+      type: object
+      properties:
+        serverSeedHash: { type: string, description: SHA-256 of the hidden server seed }
+        clientSeed: { type: string }
+        nonce: { type: integer }
+    RotateSeedResult:
+      type: object
+      properties:
+        previous:
+          type: object
+          nullable: true
+          description: The revealed seed pair — use it to verify every past round
+          properties:
+            serverSeed: { type: string }
+            serverSeedHash: { type: string }
+            clientSeed: { type: string }
+            finalNonce: { type: integer }
+        newServerSeedHash: { type: string }
+        clientSeed: { type: string }
+    RoundResultBase:
+      type: object
+      required: [roundId, game, nonce, serverSeedHash, won, multiplier, payout, balance]
+      properties:
+        roundId: { type: integer }
+        game: { type: string }
+        nonce: { type: integer }
+        serverSeedHash: { type: string }
+        won: { type: boolean }
+        multiplier: { type: number, example: 1.96 }
+        payout: { $ref: '#/components/schemas/Money' }
+        balance: { $ref: '#/components/schemas/Money' }
+    DiceResult:
+      allOf:
+        - $ref: '#/components/schemas/RoundResultBase'
+        - type: object
+          properties:
+            roll: { type: number, example: 42.17 }
+            target: { type: number, example: 50 }
+            direction: { type: string, enum: [under, over] }
+    CoinflipResult:
+      allOf:
+        - $ref: '#/components/schemas/RoundResultBase'
+        - type: object
+          properties:
+            result: { type: string, enum: [heads, tails] }
+            call: { type: string, enum: [heads, tails] }
+    SlotsResult:
+      allOf:
+        - $ref: '#/components/schemas/RoundResultBase'
+        - type: object
+          properties:
+            reels: { type: array, items: { type: string }, example: [BELL, BELL, BELL] }
+    GameRound:
+      type: object
+      properties:
+        id: { type: integer }
+        game: { type: string }
+        stake: { $ref: '#/components/schemas/Money' }
+        multiplier: { type: string }
+        payout: { $ref: '#/components/schemas/Money' }
+        result: { type: object, additionalProperties: true }
+        outcome: { type: string, enum: [win, loss] }
+        nonce: { type: integer }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        server_seed_hash: { type: string }
+        client_seed: { type: string }
+        revealed_server_seed: { type: string, nullable: true, description: Available once the seed has been rotated }
+
+    # ------------------------------------------------------------ admin
+    AdminUser:
+      allOf:
+        - $ref: '#/components/schemas/User'
+        - type: object
+          properties: { balance: { allOf: [{ $ref: '#/components/schemas/Money' }], nullable: true } }
+    AdminUserDetail:
+      allOf:
+        - $ref: '#/components/schemas/User'
+        - type: object
+          properties:
+            lastLoginAt: { allOf: [{ $ref: '#/components/schemas/Timestamp' }], nullable: true }
+            wallet: { type: object, nullable: true, properties: { balance: { $ref: '#/components/schemas/Money' }, currency: { type: string } } }
+            stats:
+              type: object
+              properties:
+                total_deposits: { $ref: '#/components/schemas/Money' }
+                total_withdrawals: { $ref: '#/components/schemas/Money' }
+                bets_placed: { type: integer }
+                total_staked: { $ref: '#/components/schemas/Money' }
+                total_returned: { $ref: '#/components/schemas/Money' }
+    AdjustBalanceResult:
+      type: object
+      properties:
+        userId: { type: integer }
+        balance: { $ref: '#/components/schemas/Money' }
+    AdminLeague:
+      type: object
+      properties:
+        id: { type: integer }
+        sport_id: { type: integer }
+        slug: { type: string }
+        name: { type: string }
+        short_name: { type: string, nullable: true }
+        country: { type: string, nullable: true }
+        country_code: { type: string, nullable: true }
+        provider_slug: { type: string, nullable: true, example: england-premier-league }
+        sync_enabled: { type: boolean }
+        is_featured: { type: boolean }
+        is_active: { type: boolean }
+        sort_order: { type: integer }
+        sport: { type: string }
     MarketInput:
       type: object
       required: [type, odds]
       properties:
-        type: { type: string, example: OVER_UNDER, description: 'See GET /sports/markets for supported types' }
+        type: { type: string, example: OVER_UNDER, description: See GET /sports/markets. Unknown types are allowed but must be settled manually. }
         line: { type: number, nullable: true, example: 2.5 }
         odds:
           type: array
+          minItems: 2
           items:
             type: object
             required: [selection, price]
             properties:
               selection: { type: string, example: OVER }
-              price: { type: number, example: 1.9 }
-
-  responses:
-    Error:
-      description: Error
-      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
-
-security:
-  - bearer: []
+              price: { type: number, minimum: 1.01, example: 1.9 }
+    CreateEventRequest:
+      type: object
+      required: [leagueId, homeTeam, awayTeam, startTime]
+      properties:
+        leagueId: { type: integer, example: 3 }
+        homeTeam: { type: string, example: Rivers United }
+        awayTeam: { type: string, example: Shooting Stars }
+        startTime: { $ref: '#/components/schemas/Timestamp' }
+        isFeatured: { type: boolean }
+        markets:
+          type: array
+          items: { $ref: '#/components/schemas/MarketInput' }
+          example:
+            - { type: '1X2', odds: [{ selection: HOME, price: 1.85 }, { selection: DRAW, price: 3.1 }, { selection: AWAY, price: 4.3 }] }
+            - { type: OVER_UNDER, line: 2.5, odds: [{ selection: OVER, price: 2.05 }, { selection: UNDER, price: 1.75 }] }
+            - { type: BTTS, odds: [{ selection: YES, price: 1.95 }, { selection: NO, price: 1.8 }] }
+    UpdateEventRequest:
+      type: object
+      properties:
+        startTime: { $ref: '#/components/schemas/Timestamp' }
+        isFeatured: { type: boolean }
+        status: { type: string, enum: [scheduled, postponed], description: postponed suspends all markets }
+        homeTeam: { type: string }
+        awayTeam: { type: string }
+    AdminEvent:
+      type: object
+      properties:
+        id: { type: integer }
+        league_id: { type: integer }
+        league_slug: { type: string }
+        league_name: { type: string }
+        home_team: { type: string }
+        away_team: { type: string }
+        start_time: { $ref: '#/components/schemas/Timestamp' }
+        status: { type: string }
+        home_score: { type: integer, nullable: true }
+        away_score: { type: integer, nullable: true }
+        ht_home_score: { type: integer, nullable: true }
+        ht_away_score: { type: integer, nullable: true }
+        is_featured: { type: boolean }
+        odds_provider: { type: string, nullable: true, description: "'odds-api-io' for feed events, null for manual ones" }
+        external_ref: { type: string, nullable: true, description: Provider event id }
+        settled_at: { allOf: [{ $ref: '#/components/schemas/Timestamp' }], nullable: true }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+        unsettled_markets: { type: integer }
+        pending_bet_legs: { type: integer }
+    ResultRequest:
+      type: object
+      required: [homeScore, awayScore]
+      properties:
+        homeScore: { type: integer, minimum: 0, example: 2 }
+        awayScore: { type: integer, minimum: 0, example: 1 }
+        htHomeScore: { type: integer, minimum: 0, example: 0, description: Needed for HT_1X2 and HT_FT }
+        htAwayScore: { type: integer, minimum: 0, example: 1 }
+    MarketSettlementSummary:
+      type: object
+      properties:
+        marketId: { type: integer }
+        legsSettled: { type: integer }
+        slipsResolved: { type: integer }
+        slipsPaid: { type: integer }
+    ResultSummary:
+      type: object
+      properties:
+        eventId: { type: integer }
+        score:
+          type: object
+          properties:
+            home: { type: integer }
+            away: { type: integer }
+            htHome: { type: integer, nullable: true }
+            htAway: { type: integer, nullable: true }
+        settledMarkets:
+          type: array
+          items:
+            allOf:
+              - $ref: '#/components/schemas/MarketSettlementSummary'
+              - type: object
+                properties:
+                  type: { type: string }
+                  line: { type: string, nullable: true }
+        needsManualSettlement:
+          type: array
+          description: Markets the engine could not settle; they were suspended for a human
+          items:
+            type: object
+            properties:
+              marketId: { type: integer }
+              type: { type: string }
+              reason: { type: string, example: HT_1X2 needs the half-time score }
+    CancelEventResult:
+      type: object
+      properties:
+        eventId: { type: integer }
+        voidedMarkets: { type: integer }
+        voidedLegs: { type: integer }
+    SettleMarketRequest:
+      type: object
+      description: Provide exactly one of the three fields.
+      properties:
+        winningSelection: { type: string, example: HOME }
+        results:
+          type: object
+          additionalProperties: { type: string, enum: [won, lost, void] }
+          example: { OVER: void, UNDER: void }
+        voidMarket: { type: boolean }
+    OddsRow:
+      type: object
+      properties:
+        id: { type: integer }
+        market_id: { type: integer }
+        selection: { type: string }
+        price_decimal: { $ref: '#/components/schemas/Odds' }
+        is_active: { type: boolean }
+        result: { type: string, enum: [pending, won, lost, void] }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+    OddsSyncSummary:
+      type: object
+      properties:
+        league: { type: string }
+        eventsSeen: { type: integer }
+        eventsCreated: { type: integer }
+        marketsCreated: { type: integer }
+        pricesUpdated: { type: integer }
+        resultsRecorded: { type: integer }
+        errors: { type: array, items: { type: string } }
+    AdminBet:
+      type: object
+      properties:
+        id: { type: integer }
+        user_id: { type: integer }
+        username: { type: string }
+        stake: { $ref: '#/components/schemas/Money' }
+        bet_type: { type: string, enum: [single, multi] }
+        total_odds: { type: string }
+        potential_payout: { $ref: '#/components/schemas/Money' }
+        payout: { allOf: [{ $ref: '#/components/schemas/Money' }], nullable: true }
+        status: { type: string, enum: [pending, won, lost, void, cashed_out] }
+        idempotency_key: { type: string, nullable: true }
+        booking_code: { type: string, nullable: true }
+        settled_at: { allOf: [{ $ref: '#/components/schemas/Timestamp' }], nullable: true }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+    AdminWithdrawal:
+      type: object
+      properties:
+        id: { type: integer }
+        user_id: { type: integer }
+        username: { type: string }
+        email: { type: string }
+        kyc_status: { type: string }
+        amount: { $ref: '#/components/schemas/Money' }
+        status: { type: string }
+        reference: { type: string }
+        bank_name: { type: string }
+        account_number: { type: string }
+        account_name: { type: string }
+        failure_reason: { type: string, nullable: true }
+        bank_account_id: { type: integer }
+        currency: { type: string }
+        transfer_code: { type: string, nullable: true, description: Paystack transfer code }
+        reviewed_by: { type: integer, nullable: true, description: Admin who approved/rejected }
+        reviewed_at: { allOf: [{ $ref: '#/components/schemas/Timestamp' }], nullable: true }
+        gateway_response: { type: object, nullable: true, additionalProperties: true, description: Last Paystack payload (for support) }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+    SummaryReport:
+      type: object
+      properties:
+        window: { type: object, properties: { from: { $ref: '#/components/schemas/Timestamp' }, to: { $ref: '#/components/schemas/Timestamp' } } }
+        sportsbook:
+          type: object
+          properties: { stakes: { $ref: '#/components/schemas/Money' }, payouts: { $ref: '#/components/schemas/Money' }, ggr: { type: string, description: Stakes minus payouts } }
+        casino:
+          type: object
+          properties: { stakes: { $ref: '#/components/schemas/Money' }, payouts: { $ref: '#/components/schemas/Money' }, ggr: { type: string } }
+        totalGgr: { type: string }
+        payments:
+          type: object
+          properties: { deposits: { $ref: '#/components/schemas/Money' }, withdrawalsNet: { $ref: '#/components/schemas/Money' }, depositors: { type: integer } }
+        adjustments: { type: string }
+        activeUsers: { type: integer }
+        newUsers: { type: integer }
+        betsPlaced: { type: integer }
+        totalCustomerBalances: { $ref: '#/components/schemas/Money' }
+        openBetLiability: { $ref: '#/components/schemas/Money' }
+    LiabilityRow:
+      type: object
+      properties:
+        event_id: { type: integer }
+        home_team: { type: string }
+        away_team: { type: string }
+        start_time: { $ref: '#/components/schemas/Timestamp' }
+        market_id: { type: integer }
+        market_type: { type: string }
+        line: { type: string, nullable: true }
+        selection: { type: string }
+        legs: { type: integer }
+        stakes: { $ref: '#/components/schemas/Money' }
+        single_liability: { type: string, nullable: true, description: 'Payout if this selection wins, from singles' }
+        multi_liability_upper_bound: { type: string, nullable: true }
+    AuditLog:
+      type: object
+      properties:
+        id: { type: integer }
+        actor_id: { type: integer, nullable: true }
+        actor_username: { type: string, nullable: true }
+        action: { type: string, example: event.result }
+        entity_type: { type: string, nullable: true }
+        entity_id: { type: string, nullable: true }
+        metadata: { type: object, additionalProperties: true }
+        ip: { type: string, nullable: true }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
 
 paths:
-  # ------------------------------------------------------------------ Auth
+  # ======================================================================== Auth
   /auth/register:
     post:
       tags: [Auth]
+      operationId: register
+      summary: Register a new account (18+)
       security: []
-      summary: Register (18+ only)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/RegisterRequest' } } }
+      responses:
+        '201': { description: Account created and logged in, content: { application/json: { schema: { $ref: '#/components/schemas/AuthResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { description: Under the minimum age (`UNDERAGE`), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: 'Username, email or phone taken (`ACCOUNT_EXISTS`)', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Log in with email, username or phone
+      description: After `MAX_FAILED_LOGINS` wrong passwords the account is locked for `LOCKOUT_MINUTES` (429 `ACCOUNT_LOCKED`).
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/LoginRequest' } } }
+      responses:
+        '200': { description: Logged in, content: { application/json: { schema: { $ref: '#/components/schemas/AuthResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshTokens
+      summary: Exchange a refresh token for a new token pair
+      description: Refresh tokens are single use. Re-using a rotated token revokes the whole session chain (`REFRESH_REUSED`).
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/RefreshRequest' } } }
+      responses:
+        '200': { description: New tokens, content: { application/json: { schema: { $ref: '#/components/schemas/TokenPair' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Revoke a refresh token
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/RefreshRequest' } } }
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /auth/logout-all:
+    post:
+      tags: [Auth]
+      operationId: logoutAll
+      summary: Revoke every session of the current user
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/forgot-password:
+    post:
+      tags: [Auth]
+      operationId: forgotPassword
+      summary: Email a password-reset link
+      description: Always returns 202, whether or not the email is registered.
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [email], properties: { email: { type: string, format: email } } } } }
+      responses:
+        '202': { description: Accepted, content: { application/json: { schema: { $ref: '#/components/schemas/Message' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /auth/reset-password:
+    post:
+      tags: [Auth]
+      operationId: resetPassword
+      summary: Set a new password using the emailed token
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [token, newPassword], properties: { token: { type: string }, newPassword: { type: string, minLength: 8 } } } } }
+      responses:
+        '200': { description: Password updated; all sessions revoked, content: { application/json: { schema: { $ref: '#/components/schemas/Message' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  # ======================================================================== Account
+  /account/me:
+    get:
+      tags: [Account]
+      operationId: getProfile
+      summary: Current user's profile and wallet
+      responses:
+        '200': { description: Profile, content: { application/json: { schema: { $ref: '#/components/schemas/Profile' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [Account]
+      operationId: updateProfile
+      summary: Update name or phone
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ProfileUpdate' } } }
+      responses:
+        '200': { description: Updated user, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /account/change-password:
+    post:
+      tags: [Account]
+      operationId: changePassword
+      summary: Change password (signs out other sessions)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ChangePasswordRequest' } } }
+      responses:
+        '200': { description: Changed, content: { application/json: { schema: { $ref: '#/components/schemas/Message' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /account/limits:
+    get:
+      tags: [Account]
+      operationId: getLimits
+      summary: Deposit limits and current usage
+      responses:
+        '200': { description: Limits, content: { application/json: { schema: { $ref: '#/components/schemas/DepositLimits' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /account/limits/deposit:
+    put:
+      tags: [Account]
+      operationId: setDepositLimit
+      summary: Set, lower, raise or remove a deposit limit
+      description: Setting a first limit or lowering one applies **immediately**. Raising or removing one is **scheduled** after a 24-hour cooling-off period.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/SetDepositLimitRequest' } } }
+      responses:
+        '200': { description: Applied or scheduled, content: { application/json: { schema: { $ref: '#/components/schemas/SetDepositLimitResult' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /account/self-exclusion:
+    post:
+      tags: [Account]
+      operationId: selfExclude
+      summary: Self-exclude from betting and deposits
+      description: Cannot be shortened or lifted early. Login and withdrawals remain available. All sessions are revoked.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/SelfExclusionRequest' } } }
+      responses:
+        '200': { description: Excluded, content: { application/json: { schema: { $ref: '#/components/schemas/SelfExclusionResult' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ======================================================================== Wallet
+  /wallet:
+    get:
+      tags: [Wallet]
+      operationId: getWallet
+      summary: Current balance
+      responses:
+        '200': { description: Wallet, content: { application/json: { schema: { $ref: '#/components/schemas/Wallet' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /wallet/transactions:
+    get:
+      tags: [Wallet]
+      operationId: listTransactions
+      summary: Ledger history (newest first)
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/offset'
+        - { name: type, in: query, schema: { type: string, enum: [deposit, withdrawal, withdrawal_reversal, bet_stake, bet_payout, bet_void_refund, bet_cashout, game_stake, game_payout, adjustment] } }
+      responses:
+        '200': { description: Transactions, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Transaction' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /wallet/deposits:
+    post:
+      tags: [Wallet]
+      operationId: startDeposit
+      summary: Start a Paystack deposit
+      description: |
+        Creates a pending deposit and a Paystack checkout. Redirect the customer to `authorizationUrl`
+        (or open Paystack Inline with `accessCode`). The wallet is credited **only** after Paystack confirms
+        payment — via the webhook, `POST /wallet/deposits/{reference}/verify`, or the reconciliation job.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/DepositRequest' } } }
+      responses:
+        '201': { description: Checkout created, content: { application/json: { schema: { $ref: '#/components/schemas/DepositInit' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+    get:
+      tags: [Wallet]
+      operationId: listDeposits
+      summary: Deposit history
+      parameters: [{ $ref: '#/components/parameters/limit' }, { $ref: '#/components/parameters/offset' }]
+      responses:
+        '200': { description: Deposits, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Deposit' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /wallet/deposits/{reference}:
+    get:
+      tags: [Wallet]
+      operationId: getDeposit
+      summary: Deposit status
+      parameters: [{ $ref: '#/components/parameters/reference' }]
+      responses:
+        '200': { description: Deposit, content: { application/json: { schema: { $ref: '#/components/schemas/Deposit' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /wallet/deposits/{reference}/verify:
+    post:
+      tags: [Wallet]
+      operationId: verifyDeposit
+      summary: Confirm a deposit with Paystack (after the checkout redirect)
+      description: Idempotent — safe to call repeatedly; the wallet is credited at most once.
+      parameters: [{ $ref: '#/components/parameters/reference' }]
+      responses:
+        '200': { description: Current deposit state, content: { application/json: { schema: { $ref: '#/components/schemas/Deposit' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+  /wallet/banks:
+    get:
+      tags: [Wallet]
+      operationId: listBanks
+      summary: Nigerian banks supported for payouts
+      responses:
+        '200': { description: Banks, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Bank' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+  /wallet/bank-accounts:
+    get:
+      tags: [Wallet]
+      operationId: listBankAccounts
+      summary: Saved payout accounts
+      responses:
+        '200': { description: Accounts, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/BankAccount' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Wallet]
+      operationId: addBankAccount
+      summary: Add a payout account
+      description: The account name is resolved with Paystack (NUBAN lookup) and a transfer recipient is created. Max 5 accounts.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/AddBankAccountRequest' } } }
+      responses:
+        '201': { description: Saved, content: { application/json: { schema: { $ref: '#/components/schemas/BankAccount' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+  /wallet/bank-accounts/{id}:
+    delete:
+      tags: [Wallet]
+      operationId: removeBankAccount
+      summary: Remove a payout account
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /wallet/withdrawals:
+    post:
+      tags: [Wallet]
+      operationId: requestWithdrawal
+      summary: Withdraw to a saved bank account (Paystack Transfer)
+      description: |
+        Requires verified KYC (configurable). Funds are held immediately. Amounts at or above
+        `WITHDRAWAL_REVIEW_THRESHOLD` wait for admin approval (`pending_review`); smaller ones are sent at once.
+        Failed or reversed transfers are refunded automatically.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/WithdrawalRequest' } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Withdrawal' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: KYC not verified (`KYC_REQUIRED`) or account restricted, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+    get:
+      tags: [Wallet]
+      operationId: listWithdrawals
+      summary: Withdrawal history
+      parameters: [{ $ref: '#/components/parameters/limit' }, { $ref: '#/components/parameters/offset' }]
+      responses:
+        '200': { description: Withdrawals, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Withdrawal' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /wallet/withdrawals/{id}:
+    get:
+      tags: [Wallet]
+      operationId: getWithdrawal
+      summary: Withdrawal status
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200': { description: Withdrawal, content: { application/json: { schema: { $ref: '#/components/schemas/Withdrawal' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ======================================================================== Sports
+  /sports:
+    get:
+      tags: [Sports]
+      operationId: listSports
+      summary: Active sports
+      security: []
+      responses:
+        '200': { description: Sports, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Sport' } } } } }
+  /sports/markets:
+    get:
+      tags: [Sports]
+      operationId: listMarketTypes
+      summary: Supported market types and their selections
+      security: []
+      responses:
+        '200': { description: Market catalogue, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/MarketDefinition' } } } } }
+  /sports/leagues:
+    get:
+      tags: [Sports]
+      operationId: listLeagues
+      summary: Leagues (EPL, LaLiga, NPFL are featured)
+      security: []
+      parameters:
+        - { name: sport, in: query, schema: { type: string }, example: football }
+        - { name: featured, in: query, schema: { type: boolean } }
+        - { name: country, in: query, schema: { type: string }, example: Nigeria }
+      responses:
+        '200': { description: Leagues, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/League' } } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /sports/leagues/{slug}:
+    get:
+      tags: [Sports]
+      operationId: getLeague
+      summary: One league
+      security: []
+      parameters: [{ name: slug, in: path, required: true, schema: { type: string }, example: premier-league }]
+      responses:
+        '200': { description: League, content: { application/json: { schema: { $ref: '#/components/schemas/League' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /sports/leagues/{slug}/events:
+    get:
+      tags: [Sports]
+      operationId: listLeagueEvents
+      summary: Fixtures in a league
+      security: []
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string }, description: 'premier-league, la-liga, npfl, serie-a, bundesliga, ligue-1, champions-league, championship', example: npfl }
+        - { name: status, in: query, schema: { type: string, enum: [upcoming, live, finished, all], default: upcoming } }
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/offset'
+      responses:
+        '200': { description: Events, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/EventSummary' } } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /sports/featured:
+    get:
+      tags: [Sports]
+      operationId: featuredBoard
+      summary: Next fixtures from each featured league
+      security: []
+      parameters: [{ name: perLeague, in: query, schema: { type: integer, minimum: 1, maximum: 20, default: 5 } }]
+      responses:
+        '200': { description: Featured board, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/FeaturedLeague' } } } } }
+  /sports/events:
+    get:
+      tags: [Sports]
+      operationId: listEvents
+      summary: Search fixtures
+      security: []
+      parameters:
+        - { name: league, in: query, schema: { type: string }, example: la-liga }
+        - { name: sport, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [upcoming, live, finished, all], default: upcoming } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: featured, in: query, schema: { type: boolean } }
+        - { name: search, in: query, description: Team name contains, schema: { type: string }, example: Enyimba }
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/offset'
+      responses:
+        '200': { description: Events, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/EventSummary' } } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /sports/events/{id}:
+    get:
+      tags: [Sports]
+      operationId: getEvent
+      summary: Fixture with all markets and odds
+      security: []
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200': { description: Event, content: { application/json: { schema: { $ref: '#/components/schemas/EventDetail' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ======================================================================== Bets
+  /sports/bets:
+    post:
+      tags: [Bets]
+      operationId: placeBet
+      summary: Place a single or accumulator bet
+      description: |
+        * Pre-match only; one selection per match; max `MAX_SELECTIONS` legs; payout capped at `MAX_PAYOUT`.
+        * Send each `price` you displayed. On movement you get **409 `ODDS_CHANGED`** with `details.changes`
+          (unless `acceptOddsChanges` allows it).
+        * Send `Idempotency-Key` so a retried request returns the original slip (200) instead of betting twice.
+      parameters:
+        - { name: Idempotency-Key, in: header, schema: { type: string, maxLength: 100 }, example: 6f1c2e1a-slip-42 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlaceBetRequest' }
+            examples:
+              single: { summary: Single, value: { stake: 1000, selections: [{ oddsId: 146, price: 1.75 }] } }
+              accumulator: { summary: Accumulator, value: { stake: 500, selections: [{ oddsId: 146, price: 1.75 }, { oddsId: 212, price: 1.9 }, { oddsId: 305, price: 1.8 }], acceptOddsChanges: higher } }
+      responses:
+        '201': { description: Placed, content: { application/json: { schema: { $ref: '#/components/schemas/BetSlip' } } } }
+        '200': { description: Idempotent replay — the slip created by an earlier request with the same key, content: { application/json: { schema: { $ref: '#/components/schemas/BetSlip' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Odds changed or selections unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                oddsChanged: { value: { error: { code: ODDS_CHANGED, message: Odds have changed, details: { changes: [{ oddsId: 146, requested: 1.75, current: '1.700' }] } } } }
+                unavailable: { value: { error: { code: SELECTIONS_UNAVAILABLE, message: Some selections are no longer available, details: { oddsIds: [146] } } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    get:
+      tags: [Bets]
+      operationId: listMyBets
+      summary: My bets (newest first)
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [pending, won, lost, void, cashed_out] } }
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/offset'
+      responses:
+        '200': { description: Bets, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/BetSlip' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /sports/bets/{id}:
+    get:
+      tags: [Bets]
+      operationId: getBet
+      summary: One of my bets
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200': { description: Bet, content: { application/json: { schema: { $ref: '#/components/schemas/BetSlip' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /sports/bets/{id}/cashout:
+    get:
+      tags: [Bets]
+      operationId: cashoutQuote
+      summary: Current cash-out offer
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200': { description: Quote, content: { application/json: { schema: { $ref: '#/components/schemas/CashoutQuote' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Bets]
+      operationId: cashout
+      summary: Cash out a pending bet
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/CashoutRequest' } } }
+      responses:
+        '200': { description: Cashed out, content: { application/json: { schema: { $ref: '#/components/schemas/CashoutResult' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: '`CASHOUT_UNAVAILABLE` or `CASHOUT_CHANGED` (value below expectedAmount)', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /sports/booking-codes:
+    post:
+      tags: [Bets]
+      operationId: createBookingCode
+      summary: Create a shareable booking code
+      description: Works anonymously or logged in.
+      security: [{}, { bearer: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/BookingCodeRequest' } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/BookingCodeCreated' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /sports/booking-codes/{code}:
+    get:
+      tags: [Bets]
+      operationId: loadBookingCode
+      summary: Load a booking code with current prices
+      security: []
+      parameters: [{ name: code, in: path, required: true, schema: { type: string }, example: NB7K2QX }]
+      responses:
+        '200': { description: Booking code, content: { application/json: { schema: { $ref: '#/components/schemas/BookingCodeDetail' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ======================================================================== Casino
+  /casino/games:
+    get:
+      tags: [Casino]
+      operationId: listGames
+      summary: Available games
+      security: []
+      responses:
+        '200': { description: Games, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Game' } } } } }
+  /casino/fairness:
+    get:
+      tags: [Casino]
+      operationId: getFairness
+      summary: Current provably-fair commitment
+      responses:
+        '200': { description: State, content: { application/json: { schema: { $ref: '#/components/schemas/FairnessState' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /casino/fairness/rotate:
+    post:
+      tags: [Casino]
+      operationId: rotateSeed
+      summary: Reveal the current server seed and start a new pair
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { clientSeed: { type: string, maxLength: 64 } } } } }
+      responses:
+        '200': { description: Rotated, content: { application/json: { schema: { $ref: '#/components/schemas/RotateSeedResult' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /casino/dice/play:
+    post:
+      tags: [Casino]
+      operationId: playDice
+      summary: Roll dice (win if roll is under/over target)
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [username, email, password, dateOfBirth]
+              required: [stake, target, direction]
               properties:
-                username: { type: string, example: chidi_o }
-                email: { type: string, example: chidi@example.com }
-                password: { type: string, example: Passw0rd! }
-                dateOfBirth: { type: string, example: '1995-04-02' }
-                phone: { type: string, example: '+2348012345678' }
-                firstName: { type: string }
-                lastName: { type: string }
+                stake: { type: number, example: 100 }
+                target: { type: number, minimum: 2, maximum: 98, example: 50 }
+                direction: { type: string, enum: [under, over] }
+                clientSeed: { type: string }
       responses:
-        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/AuthResponse' } } } }
-        '403': { $ref: '#/components/responses/Error' }
-        '409': { $ref: '#/components/responses/Error' }
-  /auth/login:
-    post:
-      tags: [Auth]
-      security: []
-      summary: Log in with email, username or phone
-      requestBody:
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [identifier, password]
-              properties:
-                identifier: { type: string }
-                password: { type: string }
-      responses:
-        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/AuthResponse' } } } }
-        '401': { $ref: '#/components/responses/Error' }
-        '429': { description: Account temporarily locked after repeated failures }
-  /auth/refresh:
-    post:
-      tags: [Auth]
-      security: []
-      summary: Rotate refresh token (reuse revokes the session chain)
-      requestBody:
-        content: { application/json: { schema: { type: object, properties: { refreshToken: { type: string } } } } }
-      responses:
-        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Tokens' } } } }
-        '401': { $ref: '#/components/responses/Error' }
-  /auth/logout:
-    post:
-      tags: [Auth]
-      security: []
-      requestBody:
-        content: { application/json: { schema: { type: object, properties: { refreshToken: { type: string } } } } }
-      responses: { '204': { description: Logged out } }
-  /auth/logout-all:
-    post: { tags: [Auth], summary: Revoke all sessions, responses: { '204': { description: OK } } }
-  /auth/forgot-password:
-    post:
-      tags: [Auth]
-      security: []
-      requestBody:
-        content: { application/json: { schema: { type: object, properties: { email: { type: string } } } } }
-      responses: { '202': { description: Accepted (same response whether or not the email exists) } }
-  /auth/reset-password:
-    post:
-      tags: [Auth]
-      security: []
-      requestBody:
-        content: { application/json: { schema: { type: object, properties: { token: { type: string }, newPassword: { type: string } } } } }
-      responses: { '200': { description: OK }, '400': { $ref: '#/components/responses/Error' } }
-
-  # ------------------------------------------------------------------ Account
-  /account/me:
-    get: { tags: [Account], summary: Profile + wallet, responses: { '200': { description: OK } } }
-    patch:
-      tags: [Account]
-      requestBody:
-        content: { application/json: { schema: { type: object, properties: { firstName: { type: string }, lastName: { type: string }, phone: { type: string } } } } }
-      responses: { '200': { description: OK } }
-  /account/change-password:
-    post:
-      tags: [Account]
-      requestBody:
-        content: { application/json: { schema: { type: object, properties: { currentPassword: { type: string }, newPassword: { type: string } } } } }
-      responses: { '200': { description: OK } }
-  /account/limits:
-    get: { tags: [Account], summary: Deposit limits and usage, responses: { '200': { description: OK } } }
-  /account/limits/deposit:
-    put:
-      tags: [Account]
-      summary: Set/lower (immediate) or raise/remove (24h cooling-off) a deposit limit
-      requestBody:
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [period, amount]
-              properties:
-                period: { type: string, enum: [daily, weekly, monthly] }
-                amount: { type: number, nullable: true, description: null removes the limit (after cooling-off) }
-      responses: { '200': { description: OK } }
-  /account/self-exclusion:
-    post:
-      tags: [Account]
-      summary: Self-exclude (cannot be shortened)
-      requestBody:
-        content: { application/json: { schema: { type: object, required: [days, confirm], properties: { days: { type: integer, minimum: 1, maximum: 3650 }, confirm: { type: boolean, enum: [true] } } } } }
-      responses: { '200': { description: OK } }
-
-  # ------------------------------------------------------------------ Wallet
-  /wallet:
-    get: { tags: [Wallet], summary: Balance, responses: { '200': { description: OK } } }
-  /wallet/transactions:
-    get:
-      tags: [Wallet]
-      summary: Ledger history
-      parameters:
-        - $ref: '#/components/parameters/limit'
-        - $ref: '#/components/parameters/offset'
-        - { name: type, in: query, schema: { type: string } }
-      responses: { '200': { description: OK } }
-  /wallet/deposits:
-    post:
-      tags: [Wallet]
-      summary: Start a Paystack deposit
-      description: Returns a Paystack `authorizationUrl` (redirect) and `accessCode` (Paystack Inline/Popup). The wallet is credited only after Paystack confirms the charge (webhook, `/verify`, or the reconciliation job).
-      requestBody:
-        content: { application/json: { schema: { type: object, required: [amount], properties: { amount: { type: number, example: 5000 } } } } }
-      responses:
-        '201':
-          description: Created
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  reference: { type: string }
-                  amount: { type: string }
-                  authorizationUrl: { type: string }
-                  accessCode: { type: string }
-                  publicKey: { type: string }
-        '422': { description: Deposit limit exceeded }
-    get:
-      tags: [Wallet]
-      parameters: [{ $ref: '#/components/parameters/limit' }, { $ref: '#/components/parameters/offset' }]
-      responses: { '200': { description: OK } }
-  /wallet/deposits/{reference}:
-    get:
-      tags: [Wallet]
-      parameters: [{ name: reference, in: path, required: true, schema: { type: string } }]
-      responses: { '200': { description: OK } }
-  /wallet/deposits/{reference}/verify:
-    post:
-      tags: [Wallet]
-      summary: Verify with Paystack after the checkout redirect (credits if paid; idempotent)
-      parameters: [{ name: reference, in: path, required: true, schema: { type: string } }]
-      responses: { '200': { description: OK } }
-  /wallet/banks:
-    get: { tags: [Wallet], summary: Nigerian banks (from Paystack), responses: { '200': { description: OK } } }
-  /wallet/bank-accounts:
-    get: { tags: [Wallet], responses: { '200': { description: OK } } }
-    post:
-      tags: [Wallet]
-      summary: Add a payout account (name resolved via Paystack)
-      requestBody:
-        content: { application/json: { schema: { type: object, required: [bankCode, accountNumber], properties: { bankCode: { type: string, example: '058' }, accountNumber: { type: string, example: '0123456789' } } } } }
-      responses: { '201': { description: Created }, '400': { $ref: '#/components/responses/Error' } }
-  /wallet/bank-accounts/{id}:
-    delete:
-      tags: [Wallet]
-      parameters: [{ $ref: '#/components/parameters/id' }]
-      responses: { '204': { description: Removed } }
-  /wallet/withdrawals:
-    post:
-      tags: [Wallet]
-      summary: Withdraw to a saved bank account (Paystack Transfer)
-      description: Requires KYC (configurable). Funds are held immediately; amounts at or above WITHDRAWAL_REVIEW_THRESHOLD wait for admin approval. Failed/reversed transfers are refunded automatically.
-      requestBody:
-        content: { application/json: { schema: { type: object, required: [amount, bankAccountId], properties: { amount: { type: number }, bankAccountId: { type: integer } } } } }
-      responses: { '201': { description: Created }, '403': { description: KYC required } }
-    get:
-      tags: [Wallet]
-      parameters: [{ $ref: '#/components/parameters/limit' }, { $ref: '#/components/parameters/offset' }]
-      responses: { '200': { description: OK } }
-  /wallet/withdrawals/{id}:
-    get:
-      tags: [Wallet]
-      parameters: [{ $ref: '#/components/parameters/id' }]
-      responses: { '200': { description: OK } }
-
-  # ------------------------------------------------------------------ Sports
-  /sports:
-    get: { tags: [Sports], security: [], responses: { '200': { description: OK } } }
-  /sports/markets:
-    get: { tags: [Sports], security: [], summary: Supported market types and selections, responses: { '200': { description: OK } } }
-  /sports/leagues:
-    get:
-      tags: [Sports]
-      security: []
-      parameters:
-        - { name: sport, in: query, schema: { type: string, example: football } }
-        - { name: featured, in: query, schema: { type: boolean } }
-        - { name: country, in: query, schema: { type: string, example: Nigeria } }
-      responses:
-        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/League' } } } } }
-  /sports/leagues/{slug}:
-    get:
-      tags: [Sports]
-      security: []
-      parameters: [{ name: slug, in: path, required: true, schema: { type: string, example: premier-league } }]
-      responses: { '200': { description: OK } }
-  /sports/leagues/{slug}/events:
-    get:
-      tags: [Sports]
-      security: []
-      parameters:
-        - { name: slug, in: path, required: true, schema: { type: string, enum: [premier-league, la-liga, npfl, serie-a, bundesliga, ligue-1, champions-league, championship] } }
-        - { name: status, in: query, schema: { type: string, enum: [upcoming, live, finished, all] } }
-        - $ref: '#/components/parameters/limit'
-        - $ref: '#/components/parameters/offset'
-      responses:
-        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/EventSummary' } } } } }
-  /sports/featured:
-    get:
-      tags: [Sports]
-      security: []
-      summary: Upcoming fixtures from each featured league (EPL, LaLiga, NPFL)
-      parameters: [{ name: perLeague, in: query, schema: { type: integer, default: 5 } }]
-      responses: { '200': { description: OK } }
-  /sports/events:
-    get:
-      tags: [Sports]
-      security: []
-      parameters:
-        - { name: league, in: query, schema: { type: string } }
-        - { name: sport, in: query, schema: { type: string } }
-        - { name: status, in: query, schema: { type: string, enum: [upcoming, live, finished, all] } }
-        - { name: from, in: query, schema: { type: string, format: date-time } }
-        - { name: to, in: query, schema: { type: string, format: date-time } }
-        - { name: featured, in: query, schema: { type: boolean } }
-        - { name: search, in: query, schema: { type: string, example: Enyimba } }
-        - $ref: '#/components/parameters/limit'
-        - $ref: '#/components/parameters/offset'
-      responses:
-        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/EventSummary' } } } } }
-  /sports/events/{id}:
-    get:
-      tags: [Sports]
-      security: []
-      parameters: [{ $ref: '#/components/parameters/id' }]
-      responses:
-        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/EventDetail' } } } }
-  /sports/booking-codes:
-    post:
-      tags: [Bets]
-      security: []
-      summary: Create a shareable booking code from selections
-      requestBody:
-        content: { application/json: { schema: { type: object, properties: { oddsIds: { type: array, items: { type: integer } } } } } }
-      responses: { '201': { description: Created } }
-  /sports/booking-codes/{code}:
-    get:
-      tags: [Bets]
-      security: []
-      parameters: [{ name: code, in: path, required: true, schema: { type: string, example: NB7K2QX } }]
-      responses: { '200': { description: OK } }
-  /sports/bets:
-    post:
-      tags: [Bets]
-      summary: Place a single or accumulator bet
-      description: |
-        Pre-match only; one selection per match. Send the `price` you displayed to detect odds
-        movement; `acceptOddsChanges` = `none` | `higher` (default) | `any`. Send an
-        `Idempotency-Key` header to make retries safe.
-      parameters: [{ name: Idempotency-Key, in: header, schema: { type: string } }]
-      requestBody:
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [stake, selections]
-              properties:
-                stake: { type: number, example: 1000 }
-                selections:
-                  type: array
-                  items: { type: object, required: [oddsId], properties: { oddsId: { type: integer }, price: { type: number } } }
-                acceptOddsChanges: { type: string, enum: [none, higher, any] }
-                bookingCode: { type: string }
-      responses:
-        '201': { description: Placed, content: { application/json: { schema: { $ref: '#/components/schemas/BetSlip' } } } }
-        '200': { description: Idempotent replay of an existing slip }
-        '409': { description: 'ODDS_CHANGED or SELECTIONS_UNAVAILABLE', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
-    get:
-      tags: [Bets]
-      parameters:
-        - { name: status, in: query, schema: { type: string, enum: [pending, won, lost, void, cashed_out] } }
-        - $ref: '#/components/parameters/limit'
-        - $ref: '#/components/parameters/offset'
-      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/BetSlip' } } } } } }
-  /sports/bets/{id}:
-    get:
-      tags: [Bets]
-      parameters: [{ $ref: '#/components/parameters/id' }]
-      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/BetSlip' } } } } }
-  /sports/bets/{id}/cashout:
-    get:
-      tags: [Bets]
-      summary: Cash-out quote
-      parameters: [{ $ref: '#/components/parameters/id' }]
-      responses: { '200': { description: '{ available, amount?, reason? }' } }
-    post:
-      tags: [Bets]
-      summary: Cash out (pass expectedAmount to guard against value changes)
-      parameters: [{ $ref: '#/components/parameters/id' }]
-      requestBody:
-        content: { application/json: { schema: { type: object, properties: { expectedAmount: { type: number } } } } }
-      responses: { '200': { description: OK }, '409': { $ref: '#/components/responses/Error' } }
-
-  # ------------------------------------------------------------------ Casino
-  /casino/games:
-    get: { tags: [Casino], security: [], responses: { '200': { description: OK } } }
-  /casino/fairness:
-    get: { tags: [Casino], summary: Current server-seed hash / client seed / nonce, responses: { '200': { description: OK } } }
-  /casino/fairness/rotate:
-    post:
-      tags: [Casino]
-      summary: Rotate seeds and reveal the previous server seed
-      requestBody: { content: { application/json: { schema: { type: object, properties: { clientSeed: { type: string } } } } } }
-      responses: { '200': { description: OK } }
-  /casino/dice/play:
-    post:
-      tags: [Casino]
-      requestBody:
-        content: { application/json: { schema: { type: object, required: [stake, target, direction], properties: { stake: { type: number }, target: { type: number, minimum: 2, maximum: 98 }, direction: { type: string, enum: [under, over] }, clientSeed: { type: string } } } } }
-      responses: { '200': { description: OK } }
+        '200': { description: Round result, content: { application/json: { schema: { $ref: '#/components/schemas/DiceResult' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /casino/coinflip/play:
     post:
       tags: [Casino]
+      operationId: playCoinflip
+      summary: Flip a coin
       requestBody:
-        content: { application/json: { schema: { type: object, required: [stake, call], properties: { stake: { type: number }, call: { type: string, enum: [heads, tails] } } } } }
-      responses: { '200': { description: OK } }
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [stake, call], properties: { stake: { type: number, example: 100 }, call: { type: string, enum: [heads, tails] }, clientSeed: { type: string } } }
+      responses:
+        '200': { description: Round result, content: { application/json: { schema: { $ref: '#/components/schemas/CoinflipResult' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /casino/slots/play:
     post:
       tags: [Casino]
-      requestBody: { content: { application/json: { schema: { type: object, required: [stake], properties: { stake: { type: number } } } } } }
-      responses: { '200': { description: OK } }
+      operationId: playSlots
+      summary: Spin three reels
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [stake], properties: { stake: { type: number, example: 50 }, clientSeed: { type: string } } }
+      responses:
+        '200': { description: Round result, content: { application/json: { schema: { $ref: '#/components/schemas/SlotsResult' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /casino/history:
     get:
       tags: [Casino]
+      operationId: casinoHistory
+      summary: My rounds (with seeds for verification)
       parameters: [{ $ref: '#/components/parameters/limit' }, { $ref: '#/components/parameters/offset' }]
-      responses: { '200': { description: OK } }
+      responses:
+        '200': { description: Rounds, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/GameRound' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
 
-  # ------------------------------------------------------------------ Webhooks
+  # ======================================================================== Webhooks
   /webhooks/paystack:
     post:
       tags: [Webhooks]
+      operationId: paystackWebhook
+      summary: Paystack webhook receiver
+      description: |
+        Configure this URL in the Paystack dashboard. Authenticated by `x-paystack-signature`
+        (HMAC-SHA512 of the raw body with your secret key). Handles `charge.success`, `transfer.success`,
+        `transfer.failed` and `transfer.reversed`; other events and unknown references are acknowledged and ignored.
+        Duplicate deliveries are idempotent.
       security: []
-      summary: Paystack webhook (charge.success, transfer.success/failed/reversed)
-      description: Verified with `x-paystack-signature` = HMAC-SHA512(secret key, raw body). Set this URL in your Paystack dashboard.
       parameters: [{ name: x-paystack-signature, in: header, required: true, schema: { type: string } }]
-      responses: { '200': { description: Acknowledged }, '401': { description: Bad signature } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { event: { type: string, example: charge.success }, data: { type: object, additionalProperties: true } } }
+      responses:
+        '200': { description: Acknowledged, content: { application/json: { schema: { type: object, properties: { received: { type: boolean } } } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { description: Bad signature (`INVALID_SIGNATURE`), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: Source IP not whitelisted (when enforced), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
 
-  # ------------------------------------------------------------------ Admin
+  # ======================================================================== Admin
   /admin/users:
     get:
       tags: [Admin]
+      operationId: adminListUsers
+      summary: Search users
       parameters:
-        - { name: search, in: query, schema: { type: string } }
-        - { name: status, in: query, schema: { type: string } }
-        - { name: kycStatus, in: query, schema: { type: string } }
+        - { name: search, in: query, description: 'Username, email or phone contains', schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [active, suspended, banned, closed] } }
+        - { name: kycStatus, in: query, schema: { type: string, enum: [unverified, pending, verified, rejected] } }
         - $ref: '#/components/parameters/limit'
         - $ref: '#/components/parameters/offset'
-      responses: { '200': { description: OK } }
+      responses:
+        '200': { description: Users, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/AdminUser' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /admin/users/{id}:
-    get: { tags: [Admin], parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: User + wallet + lifetime stats } } }
+    get:
+      tags: [Admin]
+      operationId: adminGetUser
+      summary: User with wallet and lifetime stats
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200': { description: User, content: { application/json: { schema: { $ref: '#/components/schemas/AdminUserDetail' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /admin/users/{id}/status:
     patch:
       tags: [Admin]
+      operationId: adminSetUserStatus
+      summary: Suspend, ban, close or reactivate a user
       parameters: [{ $ref: '#/components/parameters/id' }]
-      requestBody: { content: { application/json: { schema: { type: object, properties: { status: { type: string, enum: [active, suspended, banned, closed] }, reason: { type: string } } } } } }
-      responses: { '200': { description: OK } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [status, reason], properties: { status: { type: string, enum: [active, suspended, banned, closed] }, reason: { type: string, minLength: 3 } } } } }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /admin/users/{id}/kyc:
     patch:
       tags: [Admin]
+      operationId: adminSetKyc
+      summary: Set KYC status (wire your KYC provider's webhook here)
       parameters: [{ $ref: '#/components/parameters/id' }]
-      requestBody: { content: { application/json: { schema: { type: object, properties: { kycStatus: { type: string, enum: [unverified, pending, verified, rejected] }, note: { type: string } } } } } }
-      responses: { '200': { description: OK } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [kycStatus], properties: { kycStatus: { type: string, enum: [unverified, pending, verified, rejected] }, note: { type: string } } } } }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /admin/users/{id}/adjust-balance:
     post:
       tags: [Admin]
+      operationId: adminAdjustBalance
+      summary: Credit or debit a wallet (audited)
       parameters: [{ $ref: '#/components/parameters/id' }]
-      requestBody: { content: { application/json: { schema: { type: object, properties: { amount: { type: number, description: negative to debit }, note: { type: string } } } } } }
-      responses: { '200': { description: OK } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [amount, note], properties: { amount: { type: number, description: Negative to debit, example: 2500 }, note: { type: string, example: Goodwill credit — ticket 1042 } } } } }
+      responses:
+        '200': { description: New balance, content: { application/json: { schema: { $ref: '#/components/schemas/AdjustBalanceResult' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /admin/sports:
     post:
       tags: [Admin]
-      requestBody: { content: { application/json: { schema: { type: object, properties: { slug: { type: string }, name: { type: string } } } } } }
-      responses: { '201': { description: Created } }
+      operationId: adminUpsertSport
+      summary: Create or rename a sport
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [slug, name], properties: { slug: { type: string, example: basketball }, name: { type: string, example: Basketball } } } } }
+      responses:
+        '201': { description: Sport, content: { application/json: { schema: { $ref: '#/components/schemas/Sport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /admin/leagues:
-    get: { tags: [Admin], responses: { '200': { description: OK } } }
+    get:
+      tags: [Admin]
+      operationId: adminListLeagues
+      summary: All leagues incl. feed settings
+      responses:
+        '200': { description: Leagues, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/AdminLeague' } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
     post:
       tags: [Admin]
+      operationId: adminCreateLeague
+      summary: Add a league
       requestBody:
+        required: true
         content:
           application/json:
             schema:
               type: object
               required: [sportId, slug, name]
               properties:
-                sportId: { type: integer }
-                slug: { type: string }
-                name: { type: string }
-                country: { type: string }
+                sportId: { type: integer, example: 1 }
+                slug: { type: string, example: caf-champions-league }
+                name: { type: string, example: CAF Champions League }
+                shortName: { type: string }
+                country: { type: string, example: Africa }
+                countryCode: { type: string, minLength: 2, maxLength: 2 }
                 providerSlug: { type: string, description: League id at odds-api.io }
                 syncEnabled: { type: boolean }
                 isFeatured: { type: boolean }
-      responses: { '201': { description: Created } }
+                sortOrder: { type: integer }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/AdminLeague' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
   /admin/leagues/{id}:
     patch:
       tags: [Admin]
+      operationId: adminUpdateLeague
       summary: Update a league (e.g. set providerSlug and enable feed sync)
       parameters: [{ $ref: '#/components/parameters/id' }]
-      requestBody: { content: { application/json: { schema: { type: object, properties: { providerSlug: { type: string, nullable: true }, syncEnabled: { type: boolean }, isFeatured: { type: boolean }, isActive: { type: boolean } } } } } }
-      responses: { '200': { description: OK } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                shortName: { type: string }
+                providerSlug: { type: string, nullable: true, example: england-premier-league }
+                syncEnabled: { type: boolean }
+                isFeatured: { type: boolean }
+                isActive: { type: boolean }
+                sortOrder: { type: integer }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/AdminLeague' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /admin/events:
     get:
       tags: [Admin]
+      operationId: adminListEvents
+      summary: Events with settlement status
       parameters:
-        - { name: status, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [scheduled, live, finished, cancelled, postponed] } }
         - { name: league, in: query, schema: { type: string } }
-        - { name: needsResult, in: query, schema: { type: boolean }, description: Started/finished events still awaiting a result }
-      responses: { '200': { description: OK } }
+        - { name: needsResult, in: query, description: Started/finished events still awaiting a result, schema: { type: boolean } }
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/offset'
+      responses:
+        '200': { description: Events, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/AdminEvent' } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
     post:
       tags: [Admin]
-      summary: Create a fixture, optionally with markets and odds in one call
+      operationId: adminCreateEvent
+      summary: Create a fixture (optionally with markets and odds)
       requestBody:
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [leagueId, homeTeam, awayTeam, startTime]
-              properties:
-                leagueId: { type: integer }
-                homeTeam: { type: string, example: Rivers United }
-                awayTeam: { type: string, example: Shooting Stars }
-                startTime: { type: string, format: date-time }
-                isFeatured: { type: boolean }
-                markets: { type: array, items: { $ref: '#/components/schemas/MarketInput' } }
-      responses: { '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/EventDetail' } } } } }
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/CreateEventRequest' } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/EventDetail' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
   /admin/events/{id}:
     patch:
       tags: [Admin]
+      operationId: adminUpdateEvent
+      summary: Reschedule, postpone or feature a fixture
       parameters: [{ $ref: '#/components/parameters/id' }]
-      requestBody: { content: { application/json: { schema: { type: object, properties: { startTime: { type: string, format: date-time }, status: { type: string, enum: [scheduled, postponed] }, isFeatured: { type: boolean } } } } } }
-      responses: { '200': { description: OK } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/UpdateEventRequest' } } }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/EventDetail' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
   /admin/events/{id}/result:
     post:
       tags: [Admin]
-      summary: Record the final score and auto-settle every supported market
+      operationId: adminRecordResult
+      summary: Record the final score and auto-settle all supported markets
       parameters: [{ $ref: '#/components/parameters/id' }]
       requestBody:
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [homeScore, awayScore]
-              properties:
-                homeScore: { type: integer }
-                awayScore: { type: integer }
-                htHomeScore: { type: integer }
-                htAwayScore: { type: integer }
-      responses: { '200': { description: 'Settlement summary; needsManualSettlement lists markets left for a human' } }
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ResultRequest' } } }
+      responses:
+        '200': { description: Settlement summary, content: { application/json: { schema: { $ref: '#/components/schemas/ResultSummary' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: 'Not started yet, cancelled, or already settled', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
   /admin/events/{id}/cancel:
     post:
       tags: [Admin]
-      summary: Cancel/abandon an event — voids all markets and refunds/recomputes slips
+      operationId: adminCancelEvent
+      summary: Cancel/abandon — void every market and refund/recompute slips
       parameters: [{ $ref: '#/components/parameters/id' }]
-      requestBody: { content: { application/json: { schema: { type: object, properties: { reason: { type: string } } } } } }
-      responses: { '200': { description: OK } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [reason], properties: { reason: { type: string, example: Match abandoned (waterlogged pitch) } } } } }
+      responses:
+        '200': { description: Cancelled, content: { application/json: { schema: { $ref: '#/components/schemas/CancelEventResult' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
   /admin/events/{id}/markets:
     post:
       tags: [Admin]
+      operationId: adminAddMarket
+      summary: Add a market to an upcoming fixture
       parameters: [{ $ref: '#/components/parameters/id' }]
-      requestBody: { content: { application/json: { schema: { $ref: '#/components/schemas/MarketInput' } } } }
-      responses: { '201': { description: Created } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/MarketInput' } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { type: object, properties: { marketId: { type: integer } } } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
   /admin/markets/{id}/suspend:
-    post: { tags: [Admin], parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    post:
+      tags: [Admin]
+      operationId: adminSuspendMarket
+      summary: Stop betting on a market
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200': { description: Suspended, content: { application/json: { schema: { type: object, properties: { marketId: { type: integer }, status: { type: string } } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
   /admin/markets/{id}/reopen:
-    post: { tags: [Admin], parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    post:
+      tags: [Admin]
+      operationId: adminReopenMarket
+      summary: Reopen a suspended market (upcoming events only)
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200': { description: Reopened, content: { application/json: { schema: { type: object, properties: { marketId: { type: integer }, status: { type: string } } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
   /admin/markets/{id}/settle:
     post:
       tags: [Admin]
+      operationId: adminSettleMarket
       summary: Manually settle one market
       parameters: [{ $ref: '#/components/parameters/id' }]
       requestBody:
+        required: true
         content:
           application/json:
-            schema:
-              type: object
-              description: Provide exactly one of the three
-              properties:
-                winningSelection: { type: string, example: HOME }
-                results: { type: object, additionalProperties: { type: string, enum: [won, lost, void] }, example: { OVER: void, UNDER: void } }
-                voidMarket: { type: boolean }
-      responses: { '200': { description: OK } }
+            schema: { $ref: '#/components/schemas/SettleMarketRequest' }
+            examples:
+              winner: { value: { winningSelection: HOME } }
+              perSelection: { value: { results: { OVER: void, UNDER: void } } }
+              void: { value: { voidMarket: true } }
+      responses:
+        '200': { description: Settled, content: { application/json: { schema: { $ref: '#/components/schemas/MarketSettlementSummary' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
   /admin/markets/{id}/odds:
     post:
       tags: [Admin]
+      operationId: adminAddOdds
+      summary: Add a selection to a market
       parameters: [{ $ref: '#/components/parameters/id' }]
-      requestBody: { content: { application/json: { schema: { type: object, properties: { selection: { type: string }, price: { type: number } } } } } }
-      responses: { '201': { description: Created } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [selection, price], properties: { selection: { type: string, example: '3-1' }, price: { type: number, example: 15 } } } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/OddsRow' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /admin/odds/{id}:
     patch:
       tags: [Admin]
+      operationId: adminUpdateOdds
+      summary: Change a price or (de)activate a selection
       parameters: [{ $ref: '#/components/parameters/id' }]
-      requestBody: { content: { application/json: { schema: { type: object, properties: { price: { type: number }, isActive: { type: boolean } } } } } }
-      responses: { '200': { description: OK } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, minProperties: 1, properties: { price: { type: number, minimum: 1.01, example: 2.2 }, isActive: { type: boolean } } } } }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/OddsRow' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
   /admin/odds-sync:
     post:
       tags: [Admin]
+      operationId: adminSyncOdds
       summary: Pull fixtures and prices from odds-api.io now
-      requestBody: { content: { application/json: { schema: { type: object, properties: { leagues: { type: array, items: { type: string }, example: [premier-league, la-liga, npfl] } } } } } }
-      responses: { '200': { description: Per-league summary } }
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { leagues: { type: array, items: { type: string }, example: [premier-league, la-liga, npfl] } } } } }
+      responses:
+        '200': { description: Per-league summary, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/OddsSyncSummary' } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /admin/odds-provider/leagues:
     get:
       tags: [Admin]
-      summary: Discover provider league slugs (to set providerSlug)
+      operationId: adminProviderLeagues
+      summary: Discover the provider's league ids (for providerSlug)
       parameters: [{ name: sport, in: query, schema: { type: string, default: football } }]
-      responses: { '200': { description: OK } }
+      responses:
+        '200': { description: Provider leagues, content: { application/json: { schema: { type: array, items: { type: object, properties: { slug: { type: string }, name: { type: string }, country: { type: string, nullable: true } } } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { description: Odds feed not configured (`ODDS_FEED_DISABLED`), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
   /admin/bets:
     get:
       tags: [Admin]
+      operationId: adminListBets
+      summary: Search bets
       parameters:
-        - { name: status, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [pending, won, lost, void, cashed_out] } }
         - { name: userId, in: query, schema: { type: integer } }
         - { name: eventId, in: query, schema: { type: integer } }
-      responses: { '200': { description: OK } }
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/offset'
+      responses:
+        '200': { description: Bets, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/AdminBet' } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /admin/withdrawals:
     get:
       tags: [Admin]
-      parameters: [{ name: status, in: query, schema: { type: string, enum: [pending_review, approved, processing, success, failed, reversed, rejected] } }]
-      responses: { '200': { description: OK } }
+      operationId: adminListWithdrawals
+      summary: Withdrawal queue
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [pending_review, approved, processing, success, failed, reversed, rejected] } }
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/offset'
+      responses:
+        '200': { description: Withdrawals, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/AdminWithdrawal' } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /admin/withdrawals/{id}/approve:
-    post: { tags: [Admin], parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: Sent to Paystack } } }
+    post:
+      tags: [Admin]
+      operationId: adminApproveWithdrawal
+      summary: Approve and send to Paystack
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200': { description: Approved (now processing), content: { application/json: { schema: { $ref: '#/components/schemas/AdminWithdrawal' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
   /admin/withdrawals/{id}/reject:
     post:
       tags: [Admin]
+      operationId: adminRejectWithdrawal
+      summary: Reject and refund
       parameters: [{ $ref: '#/components/parameters/id' }]
-      requestBody: { content: { application/json: { schema: { type: object, properties: { reason: { type: string } } } } } }
-      responses: { '200': { description: Rejected and refunded } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [reason], properties: { reason: { type: string, example: Source of funds check failed } } } } }
+      responses:
+        '200': { description: Rejected, content: { application/json: { schema: { $ref: '#/components/schemas/AdminWithdrawal' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
   /admin/reports/summary:
     get:
       tags: [Admin]
-      summary: GGR, deposits, withdrawals, active users for a window (default last 30 days)
+      operationId: adminSummaryReport
+      summary: GGR, payments and users for a window (default last 30 days)
       parameters:
         - { name: from, in: query, schema: { type: string, format: date-time } }
         - { name: to, in: query, schema: { type: string, format: date-time } }
-      responses: { '200': { description: OK } }
+      responses:
+        '200': { description: Report, content: { application/json: { schema: { $ref: '#/components/schemas/SummaryReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /admin/reports/liability:
     get:
       tags: [Admin]
-      summary: Open exposure per selection
-      parameters: [{ name: eventId, in: query, schema: { type: integer } }]
-      responses: { '200': { description: OK } }
+      operationId: adminLiabilityReport
+      summary: Open exposure per selection (largest first)
+      parameters:
+        - { name: eventId, in: query, schema: { type: integer } }
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/offset'
+      responses:
+        '200': { description: Exposure rows, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/LiabilityRow' } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /admin/audit-logs:
     get:
       tags: [Admin]
+      operationId: adminAuditLogs
+      summary: Audit trail of privileged actions
       parameters:
-        - { name: action, in: query, schema: { type: string } }
+        - { name: action, in: query, schema: { type: string }, example: withdrawal.approve }
         - { name: entityType, in: query, schema: { type: string } }
         - { name: entityId, in: query, schema: { type: string } }
-      responses: { '200': { description: OK } }
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/offset'
+      responses:
+        '200': { description: Entries, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/AuditLog' } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ======================================================================== Operations (root paths)
+  /health:
+    get:
+      tags: [Operations]
+      operationId: health
+      summary: Liveness probe
+      security: []
+      servers: [{ url: / }]
+      responses:
+        '200': { description: Process is up, content: { application/json: { schema: { type: object, properties: { status: { type: string, enum: [ok] }, uptime: { type: number } } } } } }
+  /ready:
+    get:
+      tags: [Operations]
+      operationId: ready
+      summary: Readiness probe (checks PostgreSQL)
+      security: []
+      servers: [{ url: / }]
+      responses:
+        '200': { description: Ready, content: { application/json: { schema: { type: object, properties: { status: { type: string }, database: { type: boolean } } } } } }
+        '503': { description: Database unavailable }
+  /metrics:
+    get:
+      tags: [Operations]
+      operationId: metrics
+      summary: Prometheus metrics
+      description: "Requires `Authorization: Bearer <METRICS_TOKEN>` when METRICS_TOKEN is set."
+      security: []
+      servers: [{ url: / }]
+      responses:
+        '200': { description: Prometheus text format, content: { text/plain: { schema: { type: string } } } }
+        '401': { description: Missing/invalid metrics token }

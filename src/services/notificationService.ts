@@ -1,6 +1,8 @@
 import nodemailer, { Transporter } from 'nodemailer';
 import { env } from '../config/env';
-import { logger } from '../config/logger';
+import { createLogger, maskEmail } from '../config/logger';
+
+const logger = createLogger('email');
 
 let transporter: Transporter | null = null;
 
@@ -20,13 +22,20 @@ export interface Mail {
 export async function sendMail(mail: Mail): Promise<void> {
   const t = getTransporter();
   if (!t) {
-    if (env.isProduction) logger.warn({ to: mail.to, subject: mail.subject }, 'SMTP_URL not configured — email NOT sent');
-    else logger.info({ mail }, 'Email (SMTP not configured, logging instead)');
+    if (env.isProduction)
+      logger.warn({ event: 'email.not_sent', to: maskEmail(mail.to), subject: mail.subject }, 'SMTP_URL not configured — email NOT sent');
+    // Dev only: print the full email (including reset links) so flows can be tested without SMTP.
+    else
+      logger.info(
+        { event: 'email.logged', to: mail.to, subject: mail.subject, text: mail.text },
+        'Email (SMTP not configured, logging instead)'
+      );
     return;
   }
   try {
     await t.sendMail({ from: env.MAIL_FROM, ...mail });
+    logger.info({ event: 'email.sent', to: maskEmail(mail.to), subject: mail.subject }, 'Email sent');
   } catch (err) {
-    logger.error({ err, to: mail.to }, 'Failed to send email');
+    logger.error({ event: 'email.failed', err, to: maskEmail(mail.to), subject: mail.subject }, 'Failed to send email');
   }
 }

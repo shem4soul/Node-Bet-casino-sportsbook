@@ -7,6 +7,9 @@ import * as pf from '../lib/provablyFair';
 import * as walletRepo from '../repositories/walletRepository';
 import type { FairnessSeedRow, GameRow } from '../types/db';
 import type { Pagination } from '../lib/http';
+import { createLogger } from '../config/logger';
+
+const log = createLogger('casino');
 
 async function getGame(slug: string): Promise<GameRow> {
   const g = await queryOne<GameRow>(pool, 'SELECT * FROM games WHERE slug = $1 AND is_active', [slug]);
@@ -121,6 +124,18 @@ async function playRound<R extends Record<string, unknown>>(
       });
     }
     await c.query('UPDATE fairness_seeds SET nonce = nonce + 1 WHERE id = $1', [seed.id]);
+    log.debug(
+      {
+        event: 'casino.round',
+        game: game.slug,
+        roundId: round!.id,
+        stake: fromMinor(stakeMinor),
+        payout: fromMinor(payout),
+        multiplier,
+        nonce: seed.nonce,
+      },
+      `${game.slug} round ${payout > 0 ? 'won' : 'lost'}`
+    );
 
     return {
       roundId: round!.id,

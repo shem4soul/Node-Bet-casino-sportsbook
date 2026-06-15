@@ -1,13 +1,27 @@
 import { createApp } from './app';
 import { env } from './config/env';
-import { logger } from './config/logger';
+import { flushLogs, logger } from './config/logger';
 import { pool } from './config/db';
 import { startScheduler, stopScheduler } from './jobs/scheduler';
 
 const app = createApp();
 
 const server = app.listen(env.PORT, () => {
-  logger.info({ port: env.PORT, env: env.NODE_ENV }, `${env.APP_NAME} listening`);
+  logger.info(
+    {
+      event: 'server.started',
+      port: env.PORT,
+      env: env.NODE_ENV,
+      node: process.version,
+      docs: env.DOCS_ENABLED ? `${env.APP_BASE_URL}/docs` : false,
+      jobsInApi: env.RUN_JOBS_IN_API,
+      paystack: !env.PAYSTACK_SECRET_KEY ? 'disabled' : env.PAYSTACK_SECRET_KEY.startsWith('sk_live_') ? 'live' : 'test',
+      oddsFeed: Boolean(env.ODDS_API_KEY),
+      logLevel: env.LOG_LEVEL,
+      logFile: env.LOG_FILE ?? false,
+    },
+    `${env.APP_NAME} listening on :${env.PORT}`
+  );
   if (env.RUN_JOBS_IN_API) startScheduler();
 });
 
@@ -24,6 +38,7 @@ async function shutdown(signal: string) {
 
   const force = setTimeout(() => {
     logger.error('forced shutdown after timeout');
+    flushLogs();
     process.exit(1);
   }, 25_000);
   force.unref();
@@ -31,6 +46,7 @@ async function shutdown(signal: string) {
   server.close(async () => {
     await pool.end().catch(() => undefined);
     logger.info('shutdown complete');
+    flushLogs();
     process.exit(0);
   });
 }

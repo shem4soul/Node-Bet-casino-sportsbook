@@ -8,6 +8,9 @@ import * as walletRepo from '../repositories/walletRepository';
 import { betsPlaced } from '../middleware/metrics';
 import type { BetSelectionRow, BetSlipRow } from '../types/db';
 import type { Pagination } from '../lib/http';
+import { createLogger } from '../config/logger';
+
+const log = createLogger('bets');
 
 interface LiveOdds {
   odds_id: number;
@@ -72,7 +75,13 @@ export async function placeBet(userId: number, input: PlaceBetInput) {
       userId,
       input.idempotencyKey,
     ]);
-    if (existing) return { ...(await getBet(userId, existing.id)), idempotentReplay: true };
+    if (existing) {
+      log.info(
+        { event: 'bet.idempotent_replay', betId: existing.id, idempotencyKey: input.idempotencyKey },
+        'Returning existing slip for Idempotency-Key'
+      );
+      return { ...(await getBet(userId, existing.id)), idempotentReplay: true };
+    }
   }
 
   try {
@@ -103,6 +112,9 @@ export async function placeBet(userId: number, input: PlaceBetInput) {
         }
       }
 
+      if (unavailable.length)
+        log.info({ event: 'bet.rejected', reason: 'selections_unavailable', oddsIds: unavailable }, 'Bet rejected: selections unavailable');
+      if (changes.length) log.info({ event: 'bet.rejected', reason: 'odds_changed', policy, changes }, 'Bet rejected: odds changed');
       if (unavailable.length) throw conflict('Some selections are no longer available', 'SELECTIONS_UNAVAILABLE', { oddsIds: unavailable });
       if (changes.length) throw conflict('Odds have changed', 'ODDS_CHANGED', { changes });
 
@@ -111,6 +123,10 @@ export async function placeBet(userId: number, input: PlaceBetInput) {
       const stakeMinor = toMinor(stake);
       const potentialMinor = payoutMinor(stakeMinor, totalOdds);
       if (potentialMinor > toMinor(env.MAX_PAYOUT)) {
+        log.info(
+          { event: 'bet.rejected', reason: 'max_payout', stake, potential: fromMinor(potentialMinor) },
+          'Bet rejected: exceeds max payout'
+        );
         throw badRequest(
           `Potential payout exceeds the maximum of ${env.MAX_PAYOUT} ${env.CURRENCY}. Reduce your stake or selections.`,
           'MAX_PAYOUT_EXCEEDED'
@@ -150,7 +166,22 @@ export async function placeBet(userId: number, input: PlaceBetInput) {
       betsPlaced.inc({ bet_type: ordered.length > 1 ? 'multi' : 'single' });
       return slip!.id;
     });
-    return getBet(userId, slipId);
+    const placed = await getBet(userId, slipId);
+    log.info(
+      {
+        event: 'bet.placed',
+        betId: placed.id,
+        betType: placed.betType,
+        stake: placed.stake,
+        totalOdds: placed.totalOdds,
+        potentialPayout: placed.potentialPayout,
+        legs: placed.selections.length,
+        eventIds: placed.selections.map((x) => x.eventId),
+        bookingCode: placed.bookingCode ?? undefined,
+      },
+      `Bet placed: ${placed.betType} ${placed.stake} @ ${placed.totalOdds}`
+    );
+    return placed;
   } catch (err: any) {
     // Two concurrent requests with the same Idempotency-Key: return the winner's slip.
     if (err?.code === PG_UNIQUE_VIOLATION && input.idempotencyKey) {
@@ -293,7 +324,10 @@ export async function executeCashout(userId: number, slipId: number, expectedAmo
       referenceId: slipId,
     });
     await c.query(`UPDATE bet_slips SET status = 'cashed_out', payout = $2, settled_at = now() WHERE id = $1`, [slipId, q.amount]);
-    return { betId: slipId, cashedOut: q.amount, balance };
+    return { betId: slipId, cashedOut: q.amount, balance, stake: slip.stake };
+  }).then(({ stake, ...r }) => {
+    log.info({ event: 'bet.cashed_out', betId: slipId, stake, amount: r.cashedOut }, `Bet cashed out for ${r.cashedOut}`);
+    return r;
   });
 }
 
@@ -316,6 +350,7 @@ export async function createBookingCode(userId: number | null, oddsIds: number[]
         `INSERT INTO booking_codes (code, odds_ids, created_by, expires_at) VALUES ($1, $2, $3, now() + make_interval(hours => $4))`,
         [code, oddsIds, userId, env.BOOKING_CODE_TTL_HOURS]
       );
+      log.info({ event: 'booking_code.created', code, selections: oddsIds.length, createdBy: userId ?? undefined }, 'Booking code created');
       return { code, selections: oddsIds.length };
     } catch (err: any) {
       if (err?.code !== PG_UNIQUE_VIOLATION) throw err;

@@ -27,6 +27,8 @@ jobs:
       - run: npm run lint -- --max-warnings=0
       - run: npm run format:check
       - run: npm run typecheck
+      - name: Validate OpenAPI spec
+        run: npm run docs:validate
 
   test:
     name: Tests (PostgreSQL ${{ matrix.postgres }})
@@ -86,6 +88,8 @@ jobs:
           docker run -d --name api -p 4000:4000 $COMMON sportsbook-api:ci
           for i in $(seq 1 30); do curl -fsS localhost:4000/ready && break; sleep 2; done
           curl -fsS localhost:4000/api/v1/sports/leagues?featured=true | tee /dev/stderr | grep -q premier-league
+          curl -fsS localhost:4000/docs/openapi.json | grep -q '"openapi":"3.0.3"'
+          docker logs api 2>&1 | grep -q '"event":"server.started"'
       - name: Container logs on failure
         if: failure()
         run: docker logs api || true

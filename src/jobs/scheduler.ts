@@ -1,11 +1,14 @@
 import cron, { ScheduledTask } from 'node-cron';
 import { env } from '../config/env';
-import { logger } from '../config/logger';
+import { createLogger } from '../config/logger';
+import { runWithContext } from '../lib/requestContext';
 import { pool, withAdvisoryLock } from '../config/db';
 import { jobRuns } from '../middleware/metrics';
 import { reconcilePendingDeposits } from '../services/paymentService';
 import { reconcileWithdrawals } from '../services/withdrawalService';
 import { syncLeagues } from '../services/oddsSyncService';
+
+const logger = createLogger('jobs');
 
 /**
  * Kick-off guard: the book is pre-match only, so once an event's start time
@@ -58,15 +61,21 @@ export const JOBS: JobDef[] = [
 
 async function runJob(job: JobDef) {
   const started = Date.now();
-  try {
-    const { ran, result } = await withAdvisoryLock(job.lockKey, job.run);
-    if (!ran) return;
-    jobRuns.inc({ job: job.name, outcome: 'success' });
-    logger.info({ job: job.name, ms: Date.now() - started, result }, 'job finished');
-  } catch (err) {
-    jobRuns.inc({ job: job.name, outcome: 'error' });
-    logger.error({ err, job: job.name }, 'job failed');
-  }
+  // Every log line written while the job runs (in any service) carries `job: <name>`.
+  await runWithContext({ job: job.name }, async () => {
+    try {
+      const { ran, result } = await withAdvisoryLock(job.lockKey, job.run);
+      if (!ran) {
+        logger.debug({ event: 'job.skipped' }, 'Job tick skipped (another instance holds the lock)');
+        return;
+      }
+      jobRuns.inc({ job: job.name, outcome: 'success' });
+      logger.info({ event: 'job.finished', durationMs: Date.now() - started, result }, `Job ${job.name} finished`);
+    } catch (err) {
+      jobRuns.inc({ job: job.name, outcome: 'error' });
+      logger.error({ event: 'job.failed', err, durationMs: Date.now() - started }, `Job ${job.name} failed`);
+    }
+  });
 }
 
 let tasks: ScheduledTask[] = [];
@@ -74,16 +83,19 @@ let tasks: ScheduledTask[] = [];
 export function startScheduler(): void {
   for (const job of JOBS) {
     if (!job.enabled()) {
-      logger.info({ job: job.name }, 'job disabled (missing configuration)');
+      logger.info({ event: 'job.disabled', job: job.name }, `Job ${job.name} disabled (missing configuration)`);
       continue;
     }
     if (!cron.validate(job.schedule)) {
-      logger.error({ job: job.name, schedule: job.schedule }, 'invalid cron expression; job not scheduled');
+      logger.error({ event: 'job.invalid_schedule', job: job.name, schedule: job.schedule }, 'invalid cron expression; job not scheduled');
       continue;
     }
     tasks.push(cron.schedule(job.schedule, () => void runJob(job), { timezone: 'UTC' }));
   }
-  logger.info({ jobs: tasks.length }, 'scheduler started');
+  logger.info(
+    { event: 'scheduler.started', jobs: JOBS.filter((j) => j.enabled()).map((j) => `${j.name} (${j.schedule})`) },
+    'Scheduler started'
+  );
 }
 
 export function stopScheduler(): void {

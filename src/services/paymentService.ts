@@ -1,6 +1,6 @@
 import { PoolClient } from 'pg';
 import { env } from '../config/env';
-import { logger } from '../config/logger';
+import { createLogger, maskEmail } from '../config/logger';
 import { pool, query, queryOne, withTransaction, PG_UNIQUE_VIOLATION } from '../config/db';
 import { AppError, badRequest, notFound, unauthorized } from '../lib/errors';
 import { fromMinor, toMinor } from '../lib/money';
@@ -14,6 +14,23 @@ import type { PaymentIntentRow } from '../types/db';
 import type { Pagination } from '../lib/http';
 
 const PROVIDER = 'paystack';
+const log = createLogger('payments');
+
+type DepositOutcome = Awaited<ReturnType<typeof finalizeDeposit>>;
+
+/** Logged only AFTER the transaction commits, so a log line never claims a credit that was rolled back. */
+function logDepositOutcome(source: 'webhook' | 'verify' | 'reconcile', reference: string, r: DepositOutcome) {
+  if (r.credited) {
+    log.info(
+      { event: 'deposit.credited', source, reference, depositUserId: r.userId, amount: r.amount, channel: r.channel, balance: r.balance },
+      `Deposit credited via ${source}`
+    );
+  } else if (r.status === 'failed' && !('alreadyFinal' in r)) {
+    log.warn({ event: 'deposit.failed', source, reference }, 'Deposit marked failed');
+  } else {
+    log.debug({ event: 'deposit.unchanged', source, reference, status: r.status }, 'Deposit already final or still pending');
+  }
+}
 
 function publicIntent(i: PaymentIntentRow) {
   return {
@@ -64,6 +81,10 @@ export async function initializeDeposit(user: { id: number; email: string }, amo
       data.access_code,
       data.authorization_url,
     ]);
+    log.info(
+      { event: 'deposit.initialized', reference, amount: amountStr, currency: env.CURRENCY, email: maskEmail(user.email) },
+      'Deposit checkout created'
+    );
     return {
       reference,
       amount: amountStr,
@@ -77,6 +98,7 @@ export async function initializeDeposit(user: { id: number; email: string }, amo
       reference,
       JSON.stringify({ error: (err as Error).message }),
     ]);
+    log.error({ event: 'deposit.init_failed', reference, amount: amountStr, err }, 'Paystack transaction initialize failed');
     if (err instanceof AppError) throw err;
     throw new AppError('Could not start payment with Paystack', 502, 'PAYMENT_PROVIDER_ERROR');
   }
@@ -99,7 +121,17 @@ export async function finalizeDeposit(c: PoolClient, tx: VerifiedTransaction) {
         intent.id,
         JSON.stringify({ ...tx, mismatch: true }),
       ]);
-      logger.error({ reference: tx.reference, expected: intent.amount, got: tx.amount }, 'Deposit amount/currency mismatch');
+      log.error(
+        {
+          event: 'deposit.amount_mismatch',
+          reference: tx.reference,
+          expected: intent.amount,
+          paidKobo: tx.amount,
+          currency: tx.currency,
+          depositUserId: intent.user_id,
+        },
+        'Deposit amount/currency mismatch — NOT credited, needs investigation'
+      );
       return { status: 'failed' as const, credited: false };
     }
     await c.query(
@@ -115,7 +147,7 @@ export async function finalizeDeposit(c: PoolClient, tx: VerifiedTransaction) {
       note: `Paystack deposit ${intent.reference}${tx.channel ? ` (${tx.channel})` : ''}`,
     });
     depositsCredited.inc();
-    return { status: 'success' as const, credited: true, balance, userId: intent.user_id };
+    return { status: 'success' as const, credited: true, balance, userId: intent.user_id, amount: intent.amount, channel: tx.channel };
   }
 
   if (['failed', 'reversed'].includes(tx.status)) {
@@ -135,7 +167,7 @@ export async function verifyDeposit(userId: number, reference: string) {
   if (!intent || intent.user_id !== userId) throw notFound('Deposit');
   if (intent.status === 'pending' || intent.status === 'abandoned') {
     const tx = await paystack.verifyTransaction(reference);
-    await withTransaction((c) => finalizeDeposit(c, tx));
+    logDepositOutcome('verify', reference, await withTransaction((c) => finalizeDeposit(c, tx)));
   }
   const fresh = await queryOne<PaymentIntentRow>(pool, 'SELECT * FROM payment_intents WHERE reference = $1', [reference]);
   return publicIntent(fresh!);
@@ -171,7 +203,13 @@ interface PaystackWebhook {
  *     (defence in depth against a leaked secret / replayed payload).
  */
 export async function handlePaystackWebhook(rawBody: Buffer | undefined, signature: string | string[] | undefined) {
-  if (!isValidSignature(rawBody, signature)) throw unauthorized('Invalid webhook signature', 'INVALID_SIGNATURE');
+  if (!isValidSignature(rawBody, signature)) {
+    log.warn(
+      { event: 'webhook.invalid_signature', provider: PROVIDER, bytes: rawBody?.length ?? 0 },
+      'Rejected webhook with invalid signature'
+    );
+    throw unauthorized('Invalid webhook signature', 'INVALID_SIGNATURE');
+  }
 
   let evt: PaystackWebhook;
   try {
@@ -183,14 +221,24 @@ export async function handlePaystackWebhook(rawBody: Buffer | undefined, signatu
   if (!evt?.event || !reference) throw badRequest('Malformed webhook payload');
 
   const supported = ['charge.success', 'transfer.success', 'transfer.failed', 'transfer.reversed'];
-  if (!supported.includes(evt.event)) return { ignored: true, event: evt.event };
+  log.info({ event: 'webhook.received', provider: PROVIDER, type: evt.event, reference }, `Paystack webhook ${evt.event}`);
+  if (!supported.includes(evt.event)) {
+    log.debug({ event: 'webhook.ignored', type: evt.event, reason: 'unsupported' }, 'Ignoring unsupported webhook type');
+    return { ignored: true, event: evt.event };
+  }
 
   // Charges/transfers we didn't create (other products on the same Paystack
   // account) are acknowledged and ignored, so Paystack doesn't retry them forever.
   const known = evt.event.startsWith('charge.')
     ? await queryOne(pool, 'SELECT 1 FROM payment_intents WHERE reference = $1', [reference])
     : await queryOne(pool, 'SELECT 1 FROM withdrawals WHERE reference = $1', [reference]);
-  if (!known) return { ignored: true, reason: 'unknown reference' };
+  if (!known) {
+    log.info(
+      { event: 'webhook.ignored', type: evt.event, reference, reason: 'unknown_reference' },
+      'Ignoring webhook for a reference we did not create'
+    );
+    return { ignored: true, reason: 'unknown reference' };
+  }
 
   // For charges, confirm with Paystack *before* opening the DB transaction (no network I/O while holding locks).
   let verified: VerifiedTransaction | null = null;
@@ -199,7 +247,7 @@ export async function handlePaystackWebhook(rawBody: Buffer | undefined, signatu
   }
 
   try {
-    return await withTransaction(async (c) => {
+    const result = await withTransaction(async (c) => {
       await c.query('INSERT INTO webhook_events (provider, event_key, event_type, payload) VALUES ($1, $2, $3, $4)', [
         PROVIDER,
         `${evt.event}:${reference}`,
@@ -210,8 +258,13 @@ export async function handlePaystackWebhook(rawBody: Buffer | undefined, signatu
       if (evt.event === 'charge.success') return finalizeDeposit(c, verified!);
       return handleTransferEvent(c, evt.event as 'transfer.success' | 'transfer.failed' | 'transfer.reversed', evt.data);
     });
+    if (evt.event === 'charge.success') logDepositOutcome('webhook', reference, result as DepositOutcome);
+    return result;
   } catch (err: any) {
-    if (err?.code === PG_UNIQUE_VIOLATION && err?.constraint === 'uq_webhook_event') return { duplicate: true };
+    if (err?.code === PG_UNIQUE_VIOLATION && err?.constraint === 'uq_webhook_event') {
+      log.info({ event: 'webhook.duplicate', type: evt.event, reference }, 'Duplicate webhook delivery ignored (idempotent)');
+      return { duplicate: true };
+    }
     throw err;
   }
 }
@@ -233,9 +286,11 @@ export async function reconcilePendingDeposits(): Promise<{ checked: number; cre
     try {
       const tx = await paystack.verifyTransaction(intent.reference);
       const r = await withTransaction((c) => finalizeDeposit(c, tx));
+      logDepositOutcome('reconcile', intent.reference, r);
       if (r.credited) credited += 1;
     } catch (err) {
-      if (!(err instanceof PaystackError)) logger.error({ err, reference: intent.reference }, 'Deposit reconciliation failed');
+      if (err instanceof PaystackError) log.debug({ reference: intent.reference, err: err.message }, 'Reconcile: Paystack verify failed');
+      else log.error({ event: 'deposit.reconcile_error', err, reference: intent.reference }, 'Deposit reconciliation failed');
     }
   }
   const expired = await pool.query(
