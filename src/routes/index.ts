@@ -1,20 +1,22 @@
-import express from 'express';
+import { Router } from 'express';
 import authRoutes from './authRoutes';
+import accountRoutes from './accountRoutes';
 import walletRoutes from './walletRoutes';
-import casinoRoutes from './casinoRoutes';
 import sportsRoutes from './sportsRoutes';
+import casinoRoutes from './casinoRoutes';
 import adminRoutes from './adminRoutes';
 import webhookRoutes from './webhookRoutes';
+import { env } from '../config/env';
+import { notFound } from '../lib/errors';
 
-const router = express.Router();
+const router = Router();
 
 router.use('/auth', authRoutes);
+router.use('/account', accountRoutes);
 router.use('/wallet', walletRoutes);
-router.use('/casino', casinoRoutes);
 router.use('/sports', sportsRoutes);
+router.use('/casino', (_req, _res, next) => (env.CASINO_ENABLED ? next() : next(notFound('Casino'))), casinoRoutes);
 router.use('/admin', adminRoutes);
 router.use('/webhooks', webhookRoutes);
-
-router.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
 export default router;

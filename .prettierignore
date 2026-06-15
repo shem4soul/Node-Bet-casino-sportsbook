@@ -1,0 +1,7 @@
+dist
+node_modules
+coverage
+package-lock.json
+*.md
+migrations
+src/docs/openapi.yaml

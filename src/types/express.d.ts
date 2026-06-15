@@ -1,11 +1,16 @@
+import type { UserRole, UserStatus, KycStatus } from './db';
+
 export interface AuthUser {
   id: number;
-  role: string;
+  role: UserRole;
   username: string;
+  email: string;
+  status: UserStatus;
+  kycStatus: KycStatus;
+  selfExclusionUntil: Date | null;
 }
 
 declare global {
-  // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
     interface Request {
       user?: AuthUser;
